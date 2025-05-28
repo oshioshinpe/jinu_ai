@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'presentation/screens/ai_studio_home_page.dart';
 import 'presentation/providers/settings_provider.dart'; // To get theme mode
+import 'presentation/widgets/canvas_mode_navigator.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 class AiStudioCloneApp extends ConsumerWidget { // Use ConsumerWidget
@@ -24,8 +25,10 @@ class AiStudioCloneApp extends ConsumerWidget { // Use ConsumerWidget
       darkTheme: AppThemes.darkTheme,
       // Define Fantasy Theme
       highContrastDarkTheme: AppThemes.fantasyTheme,
-      // Home Page
-      home: const AiStudioHomePage(),
+      // Home Page wrapped with canvas mode navigator
+      home: const CanvasModeNavigator(
+        child: AiStudioHomePage(),
+      ),
       debugShowCheckedModeBanner: false,
     );
   }

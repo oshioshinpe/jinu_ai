@@ -92,13 +92,21 @@ class FileService {
 
   /// Picks an image from the gallery.
   Future<FileModel?> pickImageFromGallery() async {
-  final file = await _imagePicker.pickImage(source: ImageSource.gallery);
-  if (file != null) {
-    final fileObj = File(file.path);
-    final mimeType = getMimeType(file.path);
-    return FileModel.fromFile(fileObj, mimeType: mimeType);
-  }
-   
+    if (!await requestStoragePermission()) {
+      debugPrint("Storage permission denied.");
+      return null;
+    }
+    
+    try {
+      final file = await _imagePicker.pickImage(source: ImageSource.gallery);
+      if (file != null) {
+        final fileObj = File(file.path);
+        final mimeType = getMimeType(file.path);
+        return FileModel.fromFile(fileObj, mimeType: mimeType);
+      }
+    } catch (e) {
+      debugPrint("Error picking image from gallery: $e");
+    }
     return null;
   }
 
@@ -167,7 +175,11 @@ class FileService {
     } catch (e) {
         debugPrint("Error starting recording: $e");
         _isRecording = false;
-        _currentRecordingPath = null;
+        // Clean up the path if recording failed
+        if (_currentRecordingPath != null) {
+          await _tryDeleteFile(_currentRecordingPath!);
+          _currentRecordingPath = null;
+        }
         return false;
     }
   }

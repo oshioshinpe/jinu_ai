@@ -1,74 +1,318 @@
-// lib/data/services/openai_chat_service.dart
 import 'dart:convert';
-import 'dart:io'; // Keep for audio/image file handling if needed
-import 'package:audioplayers/audioplayers.dart';
-import 'package:dart_openai/dart_openai.dart'; // Make sure this is configured
+import 'dart:io';
+import 'dart:typed_data';
+import 'package:dart_openai/dart_openai.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
-import 'package:jinu/presentation/providers/chat_providers.dart';
+import 'package:http/http.dart' as http;
 import 'package:jinu/presentation/providers/settings_provider.dart';
+import 'package:mime/mime.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:jinu/presentation/providers/workspace_mode_provider.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:jinu/presentation/providers/memory_provider.dart';
 import 'package:uuid/uuid.dart';
-import '../models/chat_message.dart'; // Adjust import path
-import 'package:http/http.dart' as http; // Import http package
-import 'package:mime/mime.dart'; // For MIME type lookup
+import 'package:jinu/data/models/chat_message.dart';
+import 'package:jinu/data/services/http_api_client_service.dart';
+import 'package:jinu/data/services/long_term_memory_service.dart';
+import 'package:jinu/presentation/providers/canvas_mode_providers.dart';
 
-Uuid uuid = const Uuid(); // For generating unique IDs
-// NOTE: This service primarily interacts with the OpenAI SDK.
-// It relies on the API key being set globally in main.dart.
+// Unique ID generator
+const uuid = Uuid();
 
-class OpenAIChatService {
-  final Ref ref; // Use Ref for accessing other providers
+// AI Companion Service with HTTP API and Memory integration
+class AICompanionService {
+  final http.Client _httpClient = http.Client();
+  final HttpApiClientService? _httpApiClient;
+  final LongTermMemoryService? _memoryService;
+  final CanvasModeNotifier? _canvasModeNotifier;
 
-  OpenAIChatService(this.ref) {
-    // Configure OpenAI SDK instance when the service is created
-    _configureOpenAI();}
-    // Listen for settings changes to eventually re-configure if needed (more advanced)
-    // ref.listen(settingsServiceProvider, (_, settings) => _configureOpenAI(settings));
-  
-final isWebSearchEnabledProvider = Provider<bool>((ref) {
-  return ref.watch(appwmsProvider).isWebSearchModeEnabled;
-});
-
-final voiceOutputEnabledProvider = Provider<bool>((ref) {
-  return ref.watch(appwmsProvider).isVoiceModeEnabled;
-});
-final itHasImageProvider = Provider<bool>((ref) {
-  return ref.watch(appwmsProvider).isContentIncludeImageMode;
-});
-
-final itHasVoiceProvider = Provider<bool>((ref) {
-  return ref.watch(appwmsProvider).isContentIncludeVoiceMode;
-});
-  
-  // Helper to configure the OpenAI static instance based on settings
-  void _configureOpenAI() {
-    
-    final settings = ref.read(settingsServiceProvider); // Read current settings
-    if (settings.apitokenmain.isNotEmpty &&
-        settings.apitokenmain != "YOUR_OPENAI_API_KEY") {
-      OpenAI.apiKey = settings.apitokenmain;
-      debugPrint("OpenAI Service: API Key configured.");
-    } else {
-      debugPrint("OpenAI Service: Warning - API Key is empty or placeholder.");
-    }
-    if (settings.custoombaseurl.isNotEmpty) {
-      OpenAI.baseUrl = settings.custoombaseurl;
-      debugPrint(
-        "OpenAI Service: Custom Base URL configured: ${settings.custoombaseurl}",
-      );
-    } else {
-      OpenAI.baseUrl = 'https://api.openai.com'; // Reset to default if empty
-      debugPrint("OpenAI Service: Using default Base URL.");
-    }
-    // You could configure organization ID etc. here too if needed
-    OpenAI.showLogs = kDebugMode; // Show SDK logs in debug mode
-    OpenAI.showResponsesLogs = kDebugMode;
+  AICompanionService({
+    HttpApiClientService? httpApiClient,
+    LongTermMemoryService? memoryService,
+    CanvasModeNotifier? canvasModeNotifier,
+  }) : _httpApiClient = httpApiClient,
+       _memoryService = memoryService,
+       _canvasModeNotifier = canvasModeNotifier {
+    // Initialize OpenAI SDK
+    OpenAI.requestsTimeOut = const Duration(minutes: 20);
   }
 
-  final List<OpenAIToolModel> memoryTools = [
+  // Send GET request after AI response
+  Future<Map<String, dynamic>> _sendResponseGetRequest() async {
+    try {
+      // Get settings dynamically instead of static access
+      final responseUrl = 'http://api.avalai.ir/user/credit';
+      final response = await _httpClient.get(Uri.parse(responseUrl));
+      if (response.statusCode == 200) {
+        final jsonResponse = jsonDecode(response.body);
+        if (jsonResponse is Map<String, dynamic> && jsonResponse.length == 4) {
+          return jsonResponse;
+        } else {
+          throw Exception('Invalid JSON response format');
+        }
+      } else {
+        throw Exception(
+          'GET request failed with status: ${response.statusCode}',
+        );
+      }
+    } catch (e) {
+      debugPrint('Error in GET request: $e');
+      return {'error': 'Failed to fetch response: $e'};
+    }
+  }
+
+  // List available models
+  Future<List<OpenAIModelModel>> getModelList() async {
+    try {
+      final models = await OpenAI.instance.model.list();
+      return models;
+    } catch (e) {
+      debugPrint('Error listing models: $e');
+      throw RequestFailedException('Failed to list models: $e', 500);
+    }
+  }
+
+  // Retrieve model details
+  Future<OpenAIModelModel> getModelInfo(String modelId) async {
+    try {
+      final model = await OpenAI.instance.model.retrieve(modelId);
+      return model;
+    } catch (e) {
+      debugPrint('Error retrieving model $modelId: $e');
+      throw RequestFailedException('Failed to retrieve model: $e', 500);
+    }
+  }
+
+  // Safe image processing with memory management
+  Future<String> _processImageSafely(File imageFile) async {
+    try {
+      final fileSize = await imageFile.length();
+      
+      // Reduce size limit for better memory management
+      if (fileSize > 10 * 1024 * 1024) { // 10MB limit
+        throw Exception('Image file too large (${(fileSize / 1024 / 1024).toStringAsFixed(1)}MB). Maximum size is 10MB.');
+      }
+      
+      // Process in chunks to avoid memory issues
+      final bytes = await _readFileInChunks(imageFile);
+      final base64Image = await _encodeBase64Async(bytes);
+      
+      String? mimeType = lookupMimeType(imageFile.path);
+      mimeType ??= 'image/jpeg';
+      
+      return 'data:$mimeType;base64,$base64Image';
+    } catch (e) {
+      debugPrint('Error processing image: $e');
+      rethrow;
+    }
+  }
+
+  Future<Uint8List> _readFileInChunks(File file) async {
+    const chunkSize = 1024 * 1024; // 1MB chunks
+    final bytes = <int>[];
+    final stream = file.openRead();
+    
+    try {
+      await for (final chunk in stream) {
+        bytes.addAll(chunk);
+        // Add memory pressure check
+        if (bytes.length > 12 * 1024 * 1024) { // 12MB total limit
+          throw Exception('File too large for processing');
+        }
+      }
+      
+      return Uint8List.fromList(bytes);
+    } catch (e) {
+      debugPrint('Error reading file in chunks: $e');
+      rethrow;
+    }
+  }
+
+  Future<String> _encodeBase64Async(Uint8List bytes) async {
+    try {
+      // Use compute to run base64 encoding in isolate to avoid blocking UI
+      return await compute(_base64EncodeIsolate, bytes);
+    } catch (e) {
+      debugPrint('Error encoding base64: $e');
+      rethrow;
+    }
+  }
+
+  // Static function for isolate
+  static String _base64EncodeIsolate(Uint8List bytes) {
+    return base64Encode(bytes);
+  }
+
+  // Improved image message handling
+  Future<void> _handleImageMessage(
+    ChatMessage message, 
+    List<OpenAIChatCompletionChoiceMessageContentItemModel> contentParts
+  ) async {
+    if (message.contentType != ContentType.image || message.filePath == null) {
+      return;
+    }
+    
+    try {
+      final imageFile = File(message.filePath!);
+      
+      // Validate file path
+      if (!_isValidFilePath(message.filePath!)) {
+        throw FileSystemException('Invalid file path', message.filePath);
+      }
+      
+      // Check file exists with timeout
+      final exists = await _checkFileExistsWithTimeout(imageFile);
+      if (!exists) {
+        throw FileSystemException('Image file not found', message.filePath);
+      }
+      
+      final base64Image = await _processImageSafely(imageFile);
+      contentParts.add(
+        OpenAIChatCompletionChoiceMessageContentItemModel.imageUrl(base64Image),
+      );
+      
+    } on FileSystemException catch (e) {
+      debugPrint('File system error: $e');
+      contentParts.add(
+        OpenAIChatCompletionChoiceMessageContentItemModel.text(
+          '[Error: File access issue - ${e.message}]',
+        ),
+      );
+    } on OutOfMemoryError catch (e) {
+      debugPrint('Memory error processing image: $e');
+      contentParts.add(
+        OpenAIChatCompletionChoiceMessageContentItemModel.text(
+          '[Error: Image too large for device memory]',
+        ),
+      );
+    } catch (e) {
+      debugPrint('Unexpected error processing image: $e');
+      contentParts.add(
+        OpenAIChatCompletionChoiceMessageContentItemModel.text(
+          '[Error: Failed to process image - $e]',
+        ),
+      );
+    }
+  }
+
+  bool _isValidFilePath(String path) {
+    try {
+      if (path.isEmpty) return false;
+      final file = File(path);
+      // Basic validation - check if path can be parsed
+      return file.path.isNotEmpty;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  Future<bool> _checkFileExistsWithTimeout(File file) async {
+    try {
+      return await file.exists().timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => false,
+      );
+    } catch (e) {
+      debugPrint('Error checking file existence: $e');
+      return false;
+    }
+  }
+
+  // Transcribe audio file to text
+  Future<String> transcribeAudio(File audioFile) async {
+    try {
+      // Validate file exists and has content
+      if (!await audioFile.exists()) {
+        throw Exception('Audio file does not exist: ${audioFile.path}');
+      }
+      
+      final fileSize = await audioFile.length();
+      if (fileSize == 0) {
+        throw Exception('Audio file is empty: ${audioFile.path}');
+      }
+      
+      // Check file size limit (25MB for Whisper)
+      if (fileSize > 25 * 1024 * 1024) {
+        throw Exception('Audio file too large: ${(fileSize / 1024 / 1024).toStringAsFixed(1)}MB. Maximum size is 25MB.');
+      }
+      
+      final transcription = await OpenAI.instance.audio.createTranscription(
+        file: audioFile,
+        model: 'whisper-1',
+        responseFormat: OpenAIAudioResponseFormat.text,
+      );
+      return transcription.text;
+    } catch (e) {
+      debugPrint('Error transcribing audio: $e');
+      throw RequestFailedException('Failed to transcribe audio: $e', 500);
+    }
+  }
+
+  // Create speech from text
+  Future<File> createSpeech(String text, String outputFileName) async {
+    try {
+      final speechFile = await OpenAI.instance.audio.createSpeech(
+        model: 'tts-1',
+        input: text,
+        voice: 'nova',
+        responseFormat: OpenAIAudioSpeechResponseFormat.mp3,
+        outputDirectory: await Directory('speechOutput').create(),
+        outputFileName: outputFileName,
+      );
+      return speechFile;
+    } catch (e) {
+      debugPrint('Error creating speech: $e');
+      throw RequestFailedException('Failed to create speech: $e', 500);
+    }
+  }
+
+  // Generate image from prompt
+  Future<String> createImage(String prompt) async {
+    try {
+      final image = await OpenAI.instance.image.create(
+        prompt: prompt,
+        n: 1,
+        size: OpenAIImageSize.size1024,
+        responseFormat: OpenAIImageResponseFormat.url,
+      );
+      final imageUrl = image.data.first.url;
+      await _sendResponseGetRequest();
+      return imageUrl ?? '';
+    } catch (e) {
+      debugPrint('Error creating image: $e');
+      throw RequestFailedException('Failed to create image: $e', 500);
+    }
+  }
+
+  // Create embeddings for text
+  Future<List<double>> createEmbeddings(String text) async {
+    try {
+      final embedding = await OpenAI.instance.embedding.create(
+        model: 'text-embedding-ada-002',
+        input: text,
+      );
+      final embeddingVector = embedding.data.first.embeddings;
+      await _sendResponseGetRequest();
+      return embeddingVector;
+    } catch (e) {
+      debugPrint('Error creating embeddings: $e');
+      throw RequestFailedException('Failed to create embeddings: $e', 500);
+    }
+  }
+
+  // Retrieve file content
+  Future<dynamic> retrieveFileContent(String fileId) async {
+    try {
+      final fileContent = await OpenAI.instance.file.retrieveContent(fileId);
+      await _sendResponseGetRequest();
+      return fileContent;
+    } catch (e) {
+      debugPrint('Error retrieving file content: $e');
+      throw RequestFailedException('Failed to retrieve file content: $e', 500);
+    }
+  }
+
+  // AI Tools for function calling (Memory + HTTP API)
+  List<OpenAIToolModel> get _aiTools => [
+    // Memory Tools
     OpenAIToolModel(
       type: 'function',
       function: OpenAIFunctionModel(
@@ -76,19 +320,19 @@ final itHasVoiceProvider = Provider<bool>((ref) {
         description:
             'Save important information to long-term memory for future reference',
         parametersSchema: {
-          "type": "object",
-          "properties": {
-            "key": {
-              "type": "string",
-              "description":
-                  "A short, descriptive title or topic for this memory (3-5 words)",
+          'type': 'object',
+          'properties': {
+            'key': {
+              'type': 'string',
+              'description':
+                  'A short, descriptive title or topic for this memory (3-5 words)',
             },
-            "content": {
-              "type": "string",
-              "description": "The detailed information to remember",
+            'content': {
+              'type': 'string',
+              'description': 'The detailed information to remember',
             },
           },
-          "required": ["key", "content"],
+          'required': ['key', 'content'],
         },
       ),
     ),
@@ -98,519 +342,775 @@ final itHasVoiceProvider = Provider<bool>((ref) {
         name: 'search_memory',
         description: 'Search long-term memory for relevant information',
         parametersSchema: {
-          "type": "object",
-          "properties": {
-            "query": {
-              "type": "string",
-              "description": "The search term or topic to look up in memory",
+          'type': 'object',
+          'properties': {
+            'query': {
+              'type': 'string',
+              'description': 'The search term or topic to look up in memory',
             },
           },
-          "required": ["query"],
+          'required': ['query'],
+        },
+      ),
+    ),
+    
+    // HTTP API Tools
+    OpenAIToolModel(
+      type: 'function',
+      function: OpenAIFunctionModel(
+        name: 'http_get_request',
+        description: 'Make an HTTP GET request to retrieve data from an API endpoint',
+        parametersSchema: {
+          'type': 'object',
+          'properties': {
+            'url': {
+              'type': 'string',
+              'description': 'The complete URL to make the GET request to (must include http:// or https://)',
+            },
+            'headers': {
+              'type': 'string',
+              'description': 'Optional headers in format "key1:value1,key2:value2" (e.g., "Authorization:Bearer token,Content-Type:application/json")',
+            },
+            'query_params': {
+              'type': 'string',
+              'description': 'Optional query parameters in format "key1=value1&key2=value2" (e.g., "page=1&limit=10")',
+            },
+          },
+          'required': ['url'],
+        },
+      ),
+    ),
+    OpenAIToolModel(
+      type: 'function',
+      function: OpenAIFunctionModel(
+        name: 'http_post_request',
+        description: 'Make an HTTP POST request to send data to an API endpoint',
+        parametersSchema: {
+          'type': 'object',
+          'properties': {
+            'url': {
+              'type': 'string',
+              'description': 'The complete URL to make the POST request to (must include http:// or https://)',
+            },
+            'headers': {
+              'type': 'string',
+              'description': 'Optional headers in format "key1:value1,key2:value2" (e.g., "Authorization:Bearer token,Content-Type:application/json")',
+            },
+            'query_params': {
+              'type': 'string',
+              'description': 'Optional query parameters in format "key1=value1&key2=value2"',
+            },
+            'body': {
+              'type': 'string',
+              'description': 'Request body as JSON string or plain text',
+            },
+          },
+          'required': ['url'],
+        },
+      ),
+    ),
+    OpenAIToolModel(
+      type: 'function',
+      function: OpenAIFunctionModel(
+        name: 'http_patch_request',
+        description: 'Make an HTTP PATCH request to partially update data at an API endpoint',
+        parametersSchema: {
+          'type': 'object',
+          'properties': {
+            'url': {
+              'type': 'string',
+              'description': 'The complete URL to make the PATCH request to (must include http:// or https://)',
+            },
+            'headers': {
+              'type': 'string',
+              'description': 'Optional headers in format "key1:value1,key2:value2" (e.g., "Authorization:Bearer token,Content-Type:application/json")',
+            },
+            'query_params': {
+              'type': 'string',
+              'description': 'Optional query parameters in format "key1=value1&key2=value2"',
+            },
+            'body': {
+              'type': 'string',
+              'description': 'Request body as JSON string or plain text',
+            },
+          },
+          'required': ['url'],
+        },
+      ),
+    ),
+    OpenAIToolModel(
+      type: 'function',
+      function: OpenAIFunctionModel(
+        name: 'http_put_request',
+        description: 'Make an HTTP PUT request to completely update/replace data at an API endpoint',
+        parametersSchema: {
+          'type': 'object',
+          'properties': {
+            'url': {
+              'type': 'string',
+              'description': 'The complete URL to make the PUT request to (must include http:// or https://)',
+            },
+            'headers': {
+              'type': 'string',
+              'description': 'Optional headers in format "key1:value1,key2:value2" (e.g., "Authorization:Bearer token,Content-Type:application/json")',
+            },
+            'query_params': {
+              'type': 'string',
+              'description': 'Optional query parameters in format "key1=value1&key2=value2"',
+            },
+            'body': {
+              'type': 'string',
+              'description': 'Request body as JSON string or plain text',
+            },
+          },
+          'required': ['url'],
+        },
+      ),
+    ),
+    OpenAIToolModel(
+      type: 'function',
+      function: OpenAIFunctionModel(
+        name: 'http_delete_request',
+        description: 'Make an HTTP DELETE request to remove data from an API endpoint',
+        parametersSchema: {
+          'type': 'object',
+          'properties': {
+            'url': {
+              'type': 'string',
+              'description': 'The complete URL to make the DELETE request to (must include http:// or https://)',
+            },
+            'headers': {
+              'type': 'string',
+              'description': 'Optional headers in format "key1:value1,key2:value2" (e.g., "Authorization:Bearer token,Content-Type:application/json")',
+            },
+            'query_params': {
+              'type': 'string',
+              'description': 'Optional query parameters in format "key1=value1&key2=value2"',
+            },
+          },
+          'required': ['url'],
+        },
+      ),
+    ),
+    // Canvas Mode Tool
+    OpenAIToolModel(
+      type: 'function',
+      function: OpenAIFunctionModel(
+        name: 'open_canvas_mode',
+        description:
+            'Open a full-screen code editor (canvas mode) for writing, editing, and running code. Use this when the user wants to write substantial code, create a program, or work on coding projects.',
+        parametersSchema: {
+          'type': 'object',
+          'properties': {
+            'language': {
+              'type': 'string',
+              'description': 'Programming language for the code editor',
+              'enum': ['dart', 'javascript', 'python', 'java', 'cpp'],
+            },
+            'code': {
+              'type': 'string',
+              'description': 'Initial code content to display in the editor (optional)',
+            },
+            'fileName': {
+              'type': 'string',
+              'description': 'Suggested file name for the code (optional)',
+            },
+          },
+          'required': ['language'],
         },
       ),
     ),
   ];
-  
- 
-  // --- Chat Completion ---
-  Future<OpenAIChatCompletionModel> generateChatCompletion({
-    required String model,
-    required List<ChatMessage> messages, // Use our app's model
-    double? temperature,
-    int? maxTokens,
-    //topK, // Not directly supported by OpenAI chat completion API
-    double? topP,
-    Map<String, dynamic>? webSearchOptions,
-    // List<String>? stop, // Add if needed
-    // int? seed, // Add if needed
-    // Map<String, String>? responseFormat, // Add if needed
-    bool enableMemoryTools = true,
-  }) async {    List<ChatMessage> currentMessages = List.from(messages); // Work on a copy
 
-    // --- Pre-process audio messages by transcribing them --
-      debugPrint("Pre-processing voice messages for transcription...");
-      List<ChatMessage> processedAudioMessages = [];
-      for (final message in currentMessages) {
-        if (message.contentType == ContentType.audio &&
-            message.filePath != null &&
-            message.filePath!.isNotEmpty) {
-          File audioFile = File(message.filePath!);
-          if (await audioFile.exists()) {
-            debugPrint("Transcribing audio message: ${message.filePath}");
-            try {
-              final settings = ref.read(settingsServiceProvider);
-              String transcriptionModel = settings.voiceprocessingmodel.isNotEmpty
-                  ? settings.voiceprocessingmodel
-                  : "whisper-1"; // Default whisper model
+  // Mock memory storage (for local fallback when memory service is not available)
+  final Map<String, String> _memoryStore = {};
 
-              OpenAIAudioModel transcription =
-                  await OpenAI.instance.audio.createTranscription(
-                file: audioFile,
-                model: transcriptionModel,
-                responseFormat: OpenAIAudioResponseFormat.json,
-              );
-              processedAudioMessages.add(ChatMessage(
-                id: uuid.v4(),
-                sender: message.sender, // Keep original sender
-                content: transcription.text, // Transcribed text
-                timestamp: DateTime.now(),
-                contentType: ContentType.text, // Now it's text
-                mimeType: message.id, // Link back to original audio message
-              ));
-              debugPrint("Transcription result: ${transcription.text}");
-            } catch (e) {
-              debugPrint("Error transcribing audio in pre-processing: $e");
-              processedAudioMessages.add(ChatMessage(
-                id: uuid.v4(),
-                sender: message.sender,
-                content: "[Error transcribing audio: ${message.fileName ?? 'audio file'}] - ${e.toString()}",
-                timestamp: DateTime.now(),
-                contentType: ContentType.text,
-                mimeType: message.id,
-              ));
-            }
-          } else {
-            debugPrint("Audio file not found for pre-processing: ${message.filePath}");
-            processedAudioMessages.add(ChatMessage(
-              id: uuid.v4(),
-              sender: message.sender,
-              content: "[Audio file not found: ${message.fileName ?? 'audio file'}]",
-              timestamp: DateTime.now(),
-              contentType: ContentType.text,
-              mimeType: message.id,
-            ));
-          }
+  Future<String> _handleSaveMemory(OpenAIResponseToolCall toolCall) async {
+    try {
+      final decodedArgs = jsonDecode(toolCall.function.arguments);
+      final key = decodedArgs['key'] as String;
+      final content = decodedArgs['content'] as String;
+
+      debugPrint('Saving to memory - Key: $key, Content: $content');
+      
+      // Use actual memory service if available, otherwise use local storage
+      if (_memoryService != null) {
+        final result = await _memoryService!.saveMemoryItem(key, content);
+        if (result['status'] == 'Success') {
+          return result['message'] as String;
         } else {
-          processedAudioMessages.add(message); // Keep non-audio messages as they are
+          return 'Failed to save memory: ${result['message']}';
         }
-      }
-      currentMessages = processedAudioMessages; // Update messages list with transcriptions
-  
-
-    final settings = ref.read(settingsServiceProvider);
-    bool hasImage = currentMessages.any((m) => m.contentType == ContentType.image && (m.filePath != null && m.filePath!.isNotEmpty || m.fileUrl != null && m.fileUrl!.isNotEmpty));
-    bool useHttpPath = hasImage || (webSearchOptions != null && webSearchOptions.isNotEmpty);
-
-    String httpApiUrl = '${OpenAI.baseUrl}/v1/chat/completions'; // Default
-    if (settings.custoombaseurl.isNotEmpty && settings.custoombaseurl.startsWith('http')) {
-      if (settings.custoombaseurl.endsWith('/v1/chat/completions') || settings.custoombaseurl.endsWith('/chat/completions')) {
-        httpApiUrl = settings.custoombaseurl;
       } else {
-        httpApiUrl = '${settings.custoombaseurl.replaceAll(RegExp(r'/$'), '')}/v1/chat/completions';
+        // Fallback to local storage
+        _memoryStore[key] = content;
+        return "Successfully saved memory with key '$key' (local storage)";
       }
-    }
-    debugPrint("Chat Completion API URL for HTTP: $httpApiUrl");
-
-    if (useHttpPath) {
-      debugPrint("Using HTTP path for chat completion. HasImage: $hasImage, WebSearch: ${webSearchOptions != null}");
-      List<Map<String, dynamic>> httpFormattedMessages = [];
-
-      for (final message in currentMessages) {
-        String role;
-        if (message.openAIRole != null) {
-          role = message.openAIRole!.name;
-        } else {
-          switch (message.sender) {
-            case MessageSender.user: role = OpenAIChatMessageRole.user.name; break;
-            case MessageSender.ai: role = OpenAIChatMessageRole.assistant.name; break;
-            case MessageSender.system: role = OpenAIChatMessageRole.system.name; break;
-          }
-        }
-
-        List<Map<String, dynamic>> contentParts = [];
-        // Always add text part, even if it's an empty string for an image-only message
-        contentParts.add({"type": "text", "text": message.content});
-
-        if (message.contentType == ContentType.image) {
-          if (message.filePath != null && message.filePath!.isNotEmpty) {
-            File imageFile = File(message.filePath!);
-            if (await imageFile.exists()) {
-              final bytes = await imageFile.readAsBytes();
-              final base64Image = base64Encode(bytes);
-              String? mimeType = lookupMimeType(message.filePath!) ?? 'image/jpeg'; // Default
-              contentParts.add({
-                "type": "image_url",
-                "image_url": {"url": "data:$mimeType;base64,$base64Image"}
-              });
-            } else {
-              contentParts.add({"type": "text", "text": "[Image file not found: ${message.fileName}]"});
-            }
-          } else if (message.fileUrl != null && message.fileUrl!.isNotEmpty) {
-             contentParts.add({
-                "type": "image_url",
-                "image_url": {"url": message.fileUrl}
-              });
-          }
-        }
-        httpFormattedMessages.add({"role": role, "content": contentParts});
-      }
-
-      if (httpFormattedMessages.isEmpty) {
-        throw Exception("Cannot send HTTP request with no prepared messages.");
-      }
-
-      final requestBody = <String, dynamic>{
-        "model": model, // Or settings.visionprocessingmodel if specific for vision
-        "messages": httpFormattedMessages,
-        if (maxTokens != null && maxTokens > 0) "max_tokens": maxTokens,
-        if (temperature != null) "temperature": temperature,
-        if (topP != null) "top_p": topP,
-      };
-
-      if (webSearchOptions != null && webSearchOptions.isNotEmpty) {
-        requestBody.addAll(webSearchOptions);
-      }
-
-      debugPrint("--- Sending to OpenAI via HTTP ---");
-      debugPrint("Request Body for HTTP: ${jsonEncode(requestBody)}");
-
-      try {
-        final response = await http.post(
-          Uri.parse(httpApiUrl),
-          headers: {
-             'Authorization': 'Bearer ${settings.apitokenmain}',
-            'Content-Type': 'application/json',
-          },
-          body: jsonEncode(requestBody),
-        );
-
-        final responseBody = response.body;
-        debugPrint("HTTP Response Status: ${response.statusCode}");
-        // debugPrint("HTTP Response Body: $responseBody"); // Can be very verbose
-
-        if (response.statusCode == 200) {
-          final Map<String, dynamic> data = jsonDecode(responseBody);
-          return OpenAIChatCompletionModel.fromMap(data);
-        } else {
-          String errorMsg = "API Error (${response.statusCode})";
-          try {
-            final Map<String, dynamic> errJson = jsonDecode(responseBody);
-            errorMsg = errJson['error']?['message'] ?? responseBody;
-          } catch (_) {
-            errorMsg = responseBody;
-          }
-          if (response.statusCode == 401) throw Exception("OpenAI API Key Invalid or Expired (HTTP). $errorMsg");
-          if (response.statusCode == 429) throw Exception("OpenAI Rate Limit Exceeded (HTTP). $errorMsg");
-          if (response.statusCode == 400 && errorMsg.toLowerCase().contains("image")) {
-            throw Exception("Model may not support images, or image data is invalid (HTTP). Error: $errorMsg");
-          }
-          throw Exception("OpenAI API Error (HTTP ${response.statusCode}): $errorMsg");
-        }
-      } catch (e) {
-        debugPrint("Error during HTTP Chat Completion: $e");
-        rethrow;
-      }
-    } else {
-      // --- SDK Path for Text-Only Chat (or if SDK supports multimodal in future without explicit HTTP) ---
-      debugPrint("Using SDK path for chat completion.");
-      final List<OpenAIChatCompletionChoiceMessageModel> openAIMessages =
-          currentMessages.map((msg) => convertToOpenAIMessage(msg)).toList();
-
-      if (openAIMessages.isEmpty) {
-        throw Exception("Cannot send request with no valid messages.");
-      }
-
-      debugPrint("--- Sending to OpenAI Chat via SDK ---");
-      debugPrint("Model: $model");
-      // ... other params logging if needed ...
-
-      try {
-        return await OpenAI.instance.chat.create(
-          model: model,
-          messages: openAIMessages,
-          temperature: temperature,
-          maxTokens: maxTokens,
-          topP: topP,
-          tools: enableMemoryTools ? memoryTools : null,
-          toolChoice: enableMemoryTools,
-          n: 1,
-        );
-      } on RequestFailedException catch (e) {
-        debugPrint("OpenAI API Request Failed (SDK): ${e.message} (Status Code: ${e.statusCode})");
-        if (e.statusCode == 401) throw Exception("OpenAI API Key Invalid or Expired (SDK). Please check settings.");
-        if (e.statusCode == 429) throw Exception("OpenAI Rate Limit Exceeded (SDK). Please try again later.");
-        if (e.statusCode == 400 && e.message.toLowerCase().contains("image")) {
-          throw Exception("Model may not support images via SDK path, or image data is invalid (SDK). Error: ${e.message}");
-        }
-        throw Exception("OpenAI API Error (SDK ${e.statusCode}): ${e.message}");
-      } catch (e) {
-        debugPrint("Error during OpenAI Chat Completion (SDK): $e");
-        rethrow;
-      }
+    } catch (e) {
+      debugPrint('Error saving memory: $e');
+      return 'Failed to save memory: $e';
     }
   }
 
-  Future<List<String>> handleToolCalls(OpenAIChatCompletionModel chatCompletion) async {
+  Future<String> _handleSearchMemory(OpenAIResponseToolCall toolCall) async {
+    try {
+      final decodedArgs = jsonDecode(toolCall.function.arguments);
+      final query = decodedArgs['query'] as String;
+
+      debugPrint('Searching memory for: $query');
+      
+      // Use actual memory service if available, otherwise use local storage
+      if (_memoryService != null) {
+        final result = _memoryService!.retrieveMemoryItems(query);
+        if (result['status'] == 'Success') {
+          return result['data'] as String? ?? result['message'] as String;
+        } else {
+          return 'Memory search failed: ${result['message']}';
+        }
+      } else {
+        // Fallback to local storage
+        final memories =
+            _memoryStore.entries
+                .where(
+                  (entry) =>
+                      entry.key.contains(query) || entry.value.contains(query),
+                )
+                .map((entry) => 'Key: ${entry.key}, Content: ${entry.value}')
+                .toList();
+
+        if (memories.isEmpty) {
+          return "No memories found matching '$query' (local storage)";
+        } else {
+          return "Found ${memories.length} memories matching '$query' (local storage): ${memories.join('; ')}";
+        }
+      }
+    } catch (e) {
+      debugPrint('Error searching memory: $e');
+      return 'Error searching memory: $e';
+    }
+  }
+
+  // HTTP API Tool Handlers
+  Future<String> _handleHttpGetRequest(OpenAIResponseToolCall toolCall) async {
+    if (_httpApiClient == null) {
+      return 'HTTP API client not available';
+    }
+
+    try {
+      final decodedArgs = jsonDecode(toolCall.function.arguments);
+      final url = decodedArgs['url'] as String;
+      final headersString = decodedArgs['headers'] as String?;
+      final queryParamsString = decodedArgs['query_params'] as String?;
+
+      // Validate URL
+      if (!HttpApiClientService.isValidUrl(url)) {
+        return 'Invalid URL format: $url';
+      }
+
+      // Parse headers and query parameters
+      final headers = HttpApiClientService.parseHeadersString(headersString);
+      final queryParams = HttpApiClientService.parseQueryParamsString(queryParamsString);
+
+      debugPrint('Making HTTP GET request to: $url');
+      
+      final response = await _httpApiClient!.makeGetRequest(
+        url: url,
+        headers: headers,
+        queryParameters: queryParams,
+      );
+
+      return _formatHttpResponse(response);
+    } catch (e) {
+      debugPrint('Error in HTTP GET request: $e');
+      return 'HTTP GET request failed: $e';
+    }
+  }
+
+  Future<String> _handleHttpPostRequest(OpenAIResponseToolCall toolCall) async {
+    if (_httpApiClient == null) {
+      return 'HTTP API client not available';
+    }
+
+    try {
+      final decodedArgs = jsonDecode(toolCall.function.arguments);
+      final url = decodedArgs['url'] as String;
+      final headersString = decodedArgs['headers'] as String?;
+      final queryParamsString = decodedArgs['query_params'] as String?;
+      final body = decodedArgs['body'] as String?;
+
+      // Validate URL
+      if (!HttpApiClientService.isValidUrl(url)) {
+        return 'Invalid URL format: $url';
+      }
+
+      // Parse headers and query parameters
+      final headers = HttpApiClientService.parseHeadersString(headersString);
+      final queryParams = HttpApiClientService.parseQueryParamsString(queryParamsString);
+
+      debugPrint('Making HTTP POST request to: $url');
+      
+      final response = await _httpApiClient!.makePostRequest(
+        url: url,
+        headers: headers,
+        queryParameters: queryParams,
+        body: body,
+      );
+
+      return _formatHttpResponse(response);
+    } catch (e) {
+      debugPrint('Error in HTTP POST request: $e');
+      return 'HTTP POST request failed: $e';
+    }
+  }
+
+  Future<String> _handleHttpPatchRequest(OpenAIResponseToolCall toolCall) async {
+    if (_httpApiClient == null) {
+      return 'HTTP API client not available';
+    }
+
+    try {
+      final decodedArgs = jsonDecode(toolCall.function.arguments);
+      final url = decodedArgs['url'] as String;
+      final headersString = decodedArgs['headers'] as String?;
+      final queryParamsString = decodedArgs['query_params'] as String?;
+      final body = decodedArgs['body'] as String?;
+
+      // Validate URL
+      if (!HttpApiClientService.isValidUrl(url)) {
+        return 'Invalid URL format: $url';
+      }
+
+      // Parse headers and query parameters
+      final headers = HttpApiClientService.parseHeadersString(headersString);
+      final queryParams = HttpApiClientService.parseQueryParamsString(queryParamsString);
+
+      debugPrint('Making HTTP PATCH request to: $url');
+      
+      final response = await _httpApiClient!.makePatchRequest(
+        url: url,
+        headers: headers,
+        queryParameters: queryParams,
+        body: body,
+      );
+
+      return _formatHttpResponse(response);
+    } catch (e) {
+      debugPrint('Error in HTTP PATCH request: $e');
+      return 'HTTP PATCH request failed: $e';
+    }
+  }
+
+  Future<String> _handleHttpPutRequest(OpenAIResponseToolCall toolCall) async {
+    if (_httpApiClient == null) {
+      return 'HTTP API client not available';
+    }
+
+    try {
+      final decodedArgs = jsonDecode(toolCall.function.arguments);
+      final url = decodedArgs['url'] as String;
+      final headersString = decodedArgs['headers'] as String?;
+      final queryParamsString = decodedArgs['query_params'] as String?;
+      final body = decodedArgs['body'] as String?;
+
+      // Validate URL
+      if (!HttpApiClientService.isValidUrl(url)) {
+        return 'Invalid URL format: $url';
+      }
+
+      // Parse headers and query parameters
+      final headers = HttpApiClientService.parseHeadersString(headersString);
+      final queryParams = HttpApiClientService.parseQueryParamsString(queryParamsString);
+
+      debugPrint('Making HTTP PUT request to: $url');
+      
+      final response = await _httpApiClient!.makePutRequest(
+        url: url,
+        headers: headers,
+        queryParameters: queryParams,
+        body: body,
+      );
+
+      return _formatHttpResponse(response);
+    } catch (e) {
+      debugPrint('Error in HTTP PUT request: $e');
+      return 'HTTP PUT request failed: $e';
+    }
+  }
+
+  Future<String> _handleHttpDeleteRequest(OpenAIResponseToolCall toolCall) async {
+    if (_httpApiClient == null) {
+      return 'HTTP API client not available';
+    }
+
+    try {
+      final decodedArgs = jsonDecode(toolCall.function.arguments);
+      final url = decodedArgs['url'] as String;
+      final headersString = decodedArgs['headers'] as String?;
+      final queryParamsString = decodedArgs['query_params'] as String?;
+
+      // Validate URL
+      if (!HttpApiClientService.isValidUrl(url)) {
+        return 'Invalid URL format: $url';
+      }
+
+      // Parse headers and query parameters
+      final headers = HttpApiClientService.parseHeadersString(headersString);
+      final queryParams = HttpApiClientService.parseQueryParamsString(queryParamsString);
+
+      debugPrint('Making HTTP DELETE request to: $url');
+      
+      final response = await _httpApiClient!.makeDeleteRequest(
+        url: url,
+        headers: headers,
+        queryParameters: queryParams,
+      );
+
+      return _formatHttpResponse(response);
+    } catch (e) {
+      debugPrint('Error in HTTP DELETE request: $e');
+      return 'HTTP DELETE request failed: $e';
+    }
+  }
+
+  // Handle canvas mode tool call
+  Future<String> _handleCanvasMode(OpenAIResponseToolCall toolCall) async {
+    try {
+      final decodedArgs = jsonDecode(toolCall.function.arguments);
+      final language = decodedArgs['language'] as String;
+      final code = decodedArgs['code'] as String?;
+      final fileName = decodedArgs['fileName'] as String?;
+
+      debugPrint('Opening canvas mode - Language: $language, Code: ${code?.substring(0, 50) ?? 'None'}...');
+      
+      // Trigger canvas mode through the provider
+      if (_canvasModeNotifier != null) {
+        _canvasModeNotifier!.enableCanvasMode(
+          code: code,
+          language: language,
+          fileName: fileName,
+        );
+        return 'Canvas mode opened successfully for $language programming. The full-screen code editor is now available.';
+      } else {
+        return 'Canvas mode is not available at the moment.';
+      }
+    } catch (e) {
+      debugPrint('Error opening canvas mode: $e');
+      return 'Failed to open canvas mode: $e';
+    }
+  }
+
+  // Format HTTP response for AI consumption
+  String _formatHttpResponse(Map<String, dynamic> response) {
+    final buffer = StringBuffer();
+    
+    if (response['success'] == true) {
+      buffer.writeln('✅ HTTP ${response['method']} request successful');
+      buffer.writeln('Status Code: ${response['statusCode']}');
+      buffer.writeln('URL: ${response['url']}');
+      
+      if (response['contentType'] != null) {
+        buffer.writeln('Content-Type: ${response['contentType']}');
+      }
+      
+      if (response['responseSize'] != null) {
+        final sizeKB = (response['responseSize'] as int) / 1024;
+        buffer.writeln('Response Size: ${sizeKB.toStringAsFixed(1)} KB');
+      }
+      
+      buffer.writeln('\nResponse Body:');
+      final body = response['body'];
+      if (body is String) {
+        // Truncate very long responses
+        if (body.length > 2000) {
+          buffer.writeln('${body.substring(0, 2000)}...\n[Response truncated - showing first 2000 characters]');
+        } else {
+          buffer.writeln(body);
+        }
+      } else {
+        // Pretty print JSON
+        try {
+          final prettyJson = const JsonEncoder.withIndent('  ').convert(body);
+          if (prettyJson.length > 2000) {
+            buffer.writeln('${prettyJson.substring(0, 2000)}...\n[Response truncated - showing first 2000 characters]');
+          } else {
+            buffer.writeln(prettyJson);
+          }
+        } catch (e) {
+          buffer.writeln(body.toString());
+        }
+      }
+    } else {
+      buffer.writeln('❌ HTTP ${response['method']} request failed');
+      buffer.writeln('URL: ${response['url']}');
+      if (response['statusCode'] != null) {
+        buffer.writeln('Status Code: ${response['statusCode']}');
+      }
+      buffer.writeln('Error: ${response['error']}');
+    }
+    
+    return buffer.toString();
+  }
+
+  Future<List<String>> handleToolCalls(
+    OpenAIChatCompletionModel chatCompletion,
+  ) async {
     final message = chatCompletion.choices.first.message;
     final List<String> toolResults = [];
 
-    if (message.haveToolCalls && message.toolCalls != null) {
+    if (message.haveToolCalls) {
       for (var toolCall in message.toolCalls!) {
         try {
-          debugPrint("Handling tool call: ${toolCall.function.name}");
-          final decodedArgs = jsonDecode(toolCall.function.arguments);
-          String resultMessage;
-
           switch (toolCall.function.name) {
+            // Memory Tools
             case 'save_to_memory':
-              final key = decodedArgs['key'] as String?;
-              final content = decodedArgs['content'] as String?;
-              if (key != null && content != null) {
-                resultMessage = await _handleSaveMemory(key, content);
-              } else {
-                resultMessage = "Error: Missing key or content for save_to_memory.";
-              }
+              final result = await _handleSaveMemory(toolCall);
+              toolResults.add(result);
               break;
             case 'search_memory':
-              final query = decodedArgs['query'] as String?;
-              if (query != null) {
-                resultMessage = await _handleSearchMemory(query);
-              } else {
-                resultMessage = "Error: Missing query for search_memory.";
-              }
+              final result = await _handleSearchMemory(toolCall);
+              toolResults.add(result);
               break;
+            
+            // HTTP API Tools
+            case 'http_get_request':
+              final result = await _handleHttpGetRequest(toolCall);
+              toolResults.add(result);
+              break;
+            case 'http_post_request':
+              final result = await _handleHttpPostRequest(toolCall);
+              toolResults.add(result);
+              break;
+            case 'http_patch_request':
+              final result = await _handleHttpPatchRequest(toolCall);
+              toolResults.add(result);
+              break;
+            case 'http_put_request':
+              final result = await _handleHttpPutRequest(toolCall);
+              toolResults.add(result);
+              break;
+            case 'http_delete_request':
+              final result = await _handleHttpDeleteRequest(toolCall);
+              toolResults.add(result);
+              break;
+            
+            // Canvas Mode Tool
+            case 'open_canvas_mode':
+              final result = await _handleCanvasMode(toolCall);
+              toolResults.add(result);
+              break;
+            
             default:
-              debugPrint('Unhandled tool call: ${toolCall.function.name}');
-              resultMessage = 'Unknown tool called: ${toolCall.function.name}';
+              toolResults.add('Unknown function: ${toolCall.function.name}');
           }
-          // Construct the tool message response for OpenAI
-          // For simplicity, we're just collecting results.
-          // Actual implementation would add new messages to the chat history
-          // with role 'tool' and content as the result, then call chat.create again.
-          // This part is simplified for brevity based on the original structure.
-          toolResults.add(resultMessage);
-
         } catch (e) {
-          debugPrint('Error handling tool call ${toolCall.function.name}: $e');
-          toolResults.add('Error executing ${toolCall.function.name}: ${e.toString()}');
+          debugPrint('Error handling tool call: $e');
+          toolResults.add('Error handling ${toolCall.function.name}: $e');
         }
       }
     }
     return toolResults;
   }
 
-  Future<String> _handleSaveMemory(String key, String content) async {
-    final memoryService = ref.read(longTermMemoryServiceProvider);
-    debugPrint('AI is saving to memory - Key: $key, Content (preview): ${content.substring(0, (content.length > 50 ? 50 : content.length))}...');
-    final result = await memoryService.saveMemoryItem(key, content);
-    return result['status'] == 'Success'
-        ? "Successfully saved memory with key '$key'."
-        : "Failed to save memory: ${result['message']}";
-  }
+  // Generate chat completion
+  Future<OpenAIChatCompletionModel> generateChatCompletion({
+    required String model,
+    required List<ChatMessage> messages,
+    required double temperature,
+    int? maxTokens,
+    double? topP,
+    Map<String, dynamic>? webSearchOptions,
+    String? sessionId,
+  }) async {
+    try {
+      List<OpenAIChatCompletionChoiceMessageModel> openAIMessages = [];
 
-  Future<String> _handleSearchMemory(String query) async {
-    final memoryService = ref.read(longTermMemoryServiceProvider);
-    debugPrint('AI is searching memory for: $query');
-    final result = await memoryService.retrieveMemoryItems(query); // Assuming retrieveMemoryItems is synchronous or you await it
+      for (var message in messages) {
+        List<OpenAIChatCompletionChoiceMessageContentItemModel> contentParts =
+            [];
+        String finalText = message.content;
 
-    if (result['status'] == 'Success') {
-      final memories = result['relevant_memories'] as List?;
-      if (memories == null || memories.isEmpty) {
-        return "No memories found matching '$query'.";
-      } else {
-        // Format memories for better presentation to the AI
-        String formattedMemories = memories.map((mem) => "Key: ${mem['key']}, Content: ${mem['content']}").join("\n---\n");
-        return "Found ${memories.length} memories matching '$query':\n$formattedMemories";
+        if (message.contentType == ContentType.audio &&
+            message.filePath != null) {
+          try {
+            final audioFile = File(message.filePath!);
+            if (await audioFile.exists()) {
+              final transcribedText = await transcribeAudio(audioFile);
+              finalText =
+                  message.content.isNotEmpty
+                      ? '$finalText\n[Audio Transcription]: $transcribedText'
+                      : transcribedText;
+            } else {
+              finalText = message.content.isNotEmpty
+                  ? '$finalText\n[Error: Audio file not found]'
+                  : '[Error: Audio file not found]';
+            }
+          } catch (e) {
+            debugPrint('Error transcribing audio: $e');
+            finalText = message.content.isNotEmpty
+                ? '$finalText\n[Error transcribing audio: $e]'
+                : '[Error transcribing audio: $e]';
+          }
+        }
+
+        if (finalText.isNotEmpty) {
+          contentParts.add(
+            OpenAIChatCompletionChoiceMessageContentItemModel.text(finalText),
+          );
+        }
+
+        // Handle image messages with improved safety
+        if (message.contentType == ContentType.image &&
+            message.filePath != null) {
+          await _handleImageMessage(message, contentParts);
+        }
+
+        if (contentParts.isNotEmpty) {
+          openAIMessages.add(
+            OpenAIChatCompletionChoiceMessageModel(
+              content: contentParts,
+              role: OpenAIChatMessageRole.user,
+            ),
+          );
+        }
       }
-    } else {
-      return "Error searching memory: ${result['message']}";
+
+      final chatCompletion = await OpenAI.instance.chat.create(
+        model: model,
+        messages: openAIMessages,
+        tools: _aiTools,
+        temperature: temperature,
+        maxTokens: maxTokens,
+        topP: topP,
+      );
+
+      await _sendResponseGetRequest();
+      return chatCompletion;
+    } catch (e) {
+      debugPrint('Error generating chat completion: $e');
+      throw RequestFailedException(
+        'Failed to generate chat completion: $e',
+        500,
+      );
     }
   }
 
+  // Stream chat completion
+  Stream<OpenAIStreamChatCompletionModel> generateChatCompletionStream({
+    required String model,
+    required List<ChatMessage> messages,
+    required double temperature,
+    int? maxTokens,
+    double? topP,
+    String? sessionId,
+  }) async* {
+    try {
+      List<OpenAIChatCompletionChoiceMessageModel> openAIMessages = [];
 
-  Future<String?> transcribeAudioFile({
-    required String filePath,
-    String? transcriptionModelOverride,
-  }) async {
-    _configureOpenAI();
-    final settings = ref.read(settingsServiceProvider);
-    final actualTranscriptionModel = transcriptionModelOverride ??
-        (settings.voiceprocessingmodel.isNotEmpty
-            ? settings.voiceprocessingmodel
-            : "whisper-1"); // Default STT model
+      // Process messages (same as in the original code)
+      for (var message in messages) {
+        List<OpenAIChatCompletionChoiceMessageContentItemModel> contentParts =
+            [];
+        String finalText = message.content;
 
-    final file = File(filePath);
-    if (!await file.exists()) {
-      debugPrint("Error: Audio file not found for transcription: $filePath");
+        if (message.contentType == ContentType.audio &&
+            message.filePath != null) {
+          try {
+            final audioFile = File(message.filePath!);
+            if (await audioFile.exists()) {
+              final transcribedText = await transcribeAudio(audioFile);
+              finalText =
+                  message.content.isNotEmpty
+                      ? '$finalText\n[Audio Transcription]: $transcribedText'
+                      : transcribedText;
+            } else {
+              finalText = message.content.isNotEmpty
+                  ? '$finalText\n[Error: Audio file not found]'
+                  : '[Error: Audio file not found]';
+            }
+          } catch (e) {
+            debugPrint('Error transcribing audio: $e');
+            finalText = message.content.isNotEmpty
+                ? '$finalText\n[Error transcribing audio: $e]'
+                : '[Error transcribing audio: $e]';
+          }
+        }
+
+        if (finalText.isNotEmpty) {
+          contentParts.add(
+            OpenAIChatCompletionChoiceMessageContentItemModel.text(finalText),
+          );
+        }
+
+        // Handle image messages with improved safety
+        if (message.contentType == ContentType.image &&
+            message.filePath != null) {
+          await _handleImageMessage(message, contentParts);
+        }
+
+        if (contentParts.isNotEmpty) {
+          openAIMessages.add(
+            OpenAIChatCompletionChoiceMessageModel(
+              content: contentParts,
+              role: OpenAIChatMessageRole.user,
+            ),
+          );
+        }
+      }
+
+      // Create stream with the correct parameters
+      final chatStream = OpenAI.instance.chat.createStream(
+        model: model,
+        messages: openAIMessages,
+        tools: _aiTools,
+        temperature: temperature,
+        maxTokens: maxTokens,
+        topP: topP,
+      );
+
+      // Yield each stream chunk as it arrives
+      await for (final streamChunk in chatStream) {
+        yield streamChunk;
+      }
+
+      // Send GET request after stream completes
+      await _sendResponseGetRequest();
+    } catch (e) {
+      debugPrint('Error in stream chat completion: $e');
+      throw RequestFailedException('Failed to stream chat completion: $e', 500);
+    }
+  }
+
+  // Transcribe audio file
+  Future<String?> transcribeAudioFile({required String filePath}) async {
+    try {
+      return await transcribeAudio(File(filePath));
+    } catch (e) {
+      debugPrint('Error transcribing audio file: $e');
       return null;
     }
-    debugPrint("Transcribing with model: $actualTranscriptionModel");
+  }
+
+  // Create audio speech
+  Future<File?> createAudioSpeech({
+    required String textContent,
+    required String filename,
+  }) async {
     try {
-      OpenAIAudioModel transcription =
-          await OpenAI.instance.audio.createTranscription(
-        file: file,
-        model: actualTranscriptionModel,
-        responseFormat: OpenAIAudioResponseFormat.json,
-      );
-      debugPrint("Transcription successful: ${transcription.text}");
-      return transcription.text;
+      return await createSpeech(textContent, filename);
     } catch (e) {
-      debugPrint("Error transcribing audio: $e");
+      debugPrint('Error creating audio speech: $e');
       return null;
     }
-  }
-  // Image Generation (DALL-E)
-  Future<List<String>> createImage({
-    required String prompt,
-    required String model, // e.g., dall-e-3 from settings
-    required String size, // e.g., 1024x1024 from settings
-    required String quality, // e.g., standard from settings
-    int n = 1,
-    String style = 'vivid', // DALL-E 3 option: vivid or natural
-  }) async {
-    // Map string size and quality to SDK enums
-    OpenAIImageSize imageSize;
-    switch (size) {
-      case "1024x1792":
-        imageSize = OpenAIImageSize.size1792Horizontal;
-        break; // Note: Check actual enum names in your SDK version
-      case "1792x1024":
-        imageSize = OpenAIImageSize.size1792Vertical;
-        break; // Note: Might be different
-      case "1024x1024":
-      default:
-        imageSize = OpenAIImageSize.size1024;
-        break;
-    }
-    OpenAIImageQuality imageQuality =
-        quality == 'hd' ? OpenAIImageQuality.hd : OpenAIImageQuality.hd;
-    OpenAIImageStyle imageStyle =
-        style == 'natural' ? OpenAIImageStyle.natural : OpenAIImageStyle.vivid;
-
-    try {
-      debugPrint(
-        "Generating image with prompt: $prompt, Model: $model, Size: $size, Quality: $quality, Style: $style",
-      );
-      OpenAIImageModel image = await OpenAI.instance.image.create(
-        prompt: prompt,
-        model: model, // Pass model string
-        n: n,
-        size: imageSize,
-        quality: imageQuality,
-        style: imageStyle,
-        responseFormat: OpenAIImageResponseFormat.url, // Get URLs
-        // TODO: Add user if needed
-      );
-      debugPrint(
-        "Image generation successful. URLs: ${image.data.map((e) => e.url).toList()}",
-      );
-      return image.data
-          .map((item) => item.url ?? '')
-          .where((url) => url.isNotEmpty)
-          .toList();
-    } catch (e) {
-      print("Error creating image: $e");
-      if (e is RequestFailedException) {
-        print("API Error (${e.statusCode}): ${e.message}");
-        // Handle specific errors like content policy violation
-      }
-      return []; // Return empty list on error
-    }
-  }
-    
-  // --- Helper ---
-  // Converts our app's ChatMessage to the OpenAI SDK's format.
-  // Needs enhancement for multi-modal messages (images).
-  OpenAIChatCompletionChoiceMessageModel convertToOpenAIMessage(
-    ChatMessage message,
-  ) {
-    // If the message already has an OpenAI role, use that for conversion
-    if (message.openAIRole != null) {
-      return OpenAIChatCompletionChoiceMessageModel(
-        content: [
-          OpenAIChatCompletionChoiceMessageContentItemModel.text(
-            message.content,
-          ),
-        ],
-        role: OpenAIChatMessageRole.values.firstWhere(
-          (e) => e.name == message.openAIRole!.name,
-          orElse: () => OpenAIChatMessageRole.user,
-        ),
-      );
-    }
-
-    // Fallback to original sender-based conversion
-    OpenAIChatMessageRole role;
-    switch (message.sender) {
-      case MessageSender.user:
-        role = OpenAIChatMessageRole.user;
-        break;
-      case MessageSender.ai:
-        role = OpenAIChatMessageRole.assistant;
-        break;
-      case MessageSender.system:
-        role = OpenAIChatMessageRole.system;
-        break;
-    }
-
-    return OpenAIChatCompletionChoiceMessageModel(
-      content: [
-        OpenAIChatCompletionChoiceMessageContentItemModel.text(message.content),
-      ],
-      role: role,
-    );
   }
 }
 
-//     // Add text content (caption or main text)
-//     if (contentItems.isNotEmpty) {
-//       contentItems.add(
-//         OpenAIChatCompletionChoiceMessageContentItemModel.text(
-//           message.content,
-//         ),
-//       );
-//     }
+// Custom exception for request failures
+class RequestFailedException implements Exception {
+  final String message;
+  final int statusCode;
 
-//     // Add image content if applicable
-//     if (message.contentType == ContentType.image && message.filePath != null) {
-//       final imageFile = File(message.filePath!);
-//       if (await imageFile.exists()) {
-//         try {
-//           final bytes = await imageFile.readAsBytes();
-//           final base64Image = base64Encode(bytes);
-//           // Determine MIME type (simple version based on extension)
-//           String mimeType =
-//               message.mimeType ?? "image/jpeg"; // Default or use stored mime
-//           if (message.filePath!.toLowerCase().endsWith(".png"))
-//             mimeType = "image/png";
-//           // Add more types if needed (gif, webp)
+  RequestFailedException(this.message, this.statusCode);
 
-//           contentItems.add(
-//             OpenAIChatCompletionChoiceMessageContentItemModel.imageUrl(
-//               "data:$mimeType;base64,$base64Image",
-//             ),
-//           );
-//           debugPrint(
-//             "Added image content from path: ${message.filePath} as base64 data URI.",
-//           );
-//         } catch (e) {
-//           debugPrint(
-//             "Error reading or encoding image file ${message.filePath}: $e",
-//           );
-//           // Optionally add an error text part instead?
-//           contentItems.add(
-//             OpenAIChatCompletionChoiceMessageContentItemModel.text(
-//               "[Error loading image: ${e.toString()}]",
-//             ),
-//           );
-//         }
-//       } else {
-//         debugPrint("Image file not found at path: ${message.filePath}");
-//         contentItems.add(
-//           OpenAIChatCompletionChoiceMessageContentItemModel.text(
-//             "[Image file not found]",
-//           ),
-//         );
-//       }
-//     } else if (message.contentType == ContentType.image &&
-//         message.fileUrl != null) {
-//       // If only URL is provided (less common for user uploads, maybe for AI responses)
-//       contentItems.add(
-//         OpenAIChatCompletionChoiceMessageContentItemModel.imageUrl(
-//           message.fileUrl!,
-//         ),
-//       );
-//       debugPrint("Added image content from URL: ${message.fileUrl}");
-//     }
-   
-// }
+  @override
+  String toString() => 'RequestFailedException: $message (Status: $statusCode)';
+}

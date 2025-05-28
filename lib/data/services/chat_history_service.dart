@@ -176,6 +176,23 @@ class ChatHistoryService with ChangeNotifier {
     }
   }
 
+  // Updates an existing message in a session
+  Future<void> updateMessageInSession(String sessionId, String messageId, ChatMessage updatedMessage) async {
+    final session = _chatSessions.firstWhere(
+      (s) => s.id == sessionId,
+      orElse: () => throw Exception("Session $sessionId not found")
+    );
+    
+    final messageIndex = session.messages.indexWhere((m) => m.id == messageId);
+    if (messageIndex != -1) {
+      session.messages[messageIndex] = updatedMessage;
+      await saveChatSession(session);
+      notifyListeners(); // Notify UI of the update
+    } else {
+      debugPrint("Warning: Cannot update non-existent message $messageId in session $sessionId");
+    }
+  }
+
 
   // Creates a new, empty chat session but DOES NOT save it until first message. Sets it active.
   ChatSessionItem startNewChat() {

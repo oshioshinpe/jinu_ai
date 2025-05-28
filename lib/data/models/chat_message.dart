@@ -109,7 +109,9 @@ class ChatMessage {
               (e) => e.name == json['contentType'],
           orElse: () => ContentType.text, // Default on error
         ),
-        timestamp: DateTime.tryParse(json['timestamp'] ?? '') ?? DateTime.now(),
+        timestamp: json['timestamp'] != null 
+            ? DateTime.tryParse(json['timestamp']) ?? DateTime.now()
+            : DateTime.now(),
         metadata: json['metadata'] != null
             ? Map<String, dynamic>.from(json['metadata'])
             : null,

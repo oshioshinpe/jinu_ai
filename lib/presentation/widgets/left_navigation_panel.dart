@@ -22,6 +22,8 @@ class LeftNavigationPanel extends ConsumerWidget {
     final chatHistory = ref.watch(chatSessionsProvider); // Watch the filtered list
     final currentChatId = ref.watch(activeChatIdProvider);
     final chatController = ref.read(chatControllerProvider.notifier); // For actions
+    // Also watch the active session to ensure title updates are reflected
+    final activeSession = ref.watch(activeChatSessionProvider);
     // No need to watch sidebarCollapsedProvider directly if passed via constructor
 
     final bool showText = !isCollapsed || isMobileLayout; // Determine when to show text

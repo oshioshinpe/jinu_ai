@@ -26,7 +26,15 @@ class FileModel {
   factory FileModel.fromFile(File file, {String? mimeType}) {
     final path = file.path;
     final fileName = path.split('/').last;
-    final fileStat = file.statSync();
+    
+    // Safely get file stats with error handling
+    FileStat? fileStat;
+    try {
+      fileStat = file.statSync();
+    } catch (e) {
+      // If we can't get file stats, use defaults
+      fileStat = null;
+    }
 
     // Determine file type based on mimeType or extension
     final isImage = mimeType?.startsWith('image/') ?? false;
@@ -37,8 +45,8 @@ class FileModel {
       file: file,
       mimeType: mimeType,
       name: fileName,
-      creationDate: fileStat.modified,
-      size: fileStat.size,
+      creationDate: fileStat?.modified,
+      size: fileStat?.size ?? 0,
       path: path,
       isImage: isImage,
       isAudio: isAudio,
@@ -70,11 +78,11 @@ class FileModel {
       mimeType: map['mimeType'],
       name: map['name'],
       size: map['size'],
-      creationDate: DateTime.parse(map['creationDate']),
+      creationDate: map['creationDate'] != null ? DateTime.parse(map['creationDate']) : null,
       path: map['path'],
-      isImage: map['isImage'],
-      isAudio: map['isAudio'],
-      isVideo: map['isVideo'],
+      isImage: map['isImage'] ?? false,
+      isAudio: map['isAudio'] ?? false,
+      isVideo: map['isVideo'] ?? false,
     );
   }
 

@@ -3,6 +3,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../data/services/openai_chat_service.dart';
 import '../../data/services/title_generator_service.dart';
 import 'settings_provider.dart'; // Need settings for title generator API key/model
+import 'http_api_client_provider.dart';
+import 'memory_provider.dart';
+import 'canvas_mode_providers.dart';
 
 // Provider for the raw OpenAI Chat Service
   final container = ProviderContainer();
@@ -11,10 +14,24 @@ import 'settings_provider.dart'; // Need settings for title generator API key/mo
   final apiKey = settingsService.apitokenmain;
   final title_model = settingsService.defaultchatmodel;
 
+// Provider for AI Companion Service with HTTP API and Memory integration
+final aiCompanionServiceProvider = Provider<AICompanionService>((ref) {
+  // Get the HTTP API client, memory service, and canvas mode notifier
+  final httpApiClient = ref.read(httpApiClientProvider);
+  final memoryService = ref.read(longTermMemoryServiceProvider);
+  final canvasModeNotifier = ref.read(canvasModeProvider.notifier);
+  
+  // Create the AI companion service with dependencies
+  return AICompanionService(
+    httpApiClient: httpApiClient,
+    memoryService: memoryService,
+    canvasModeNotifier: canvasModeNotifier,
+  );
+});
 
-final openAIChatServiceProvider = Provider<OpenAIChatService>((ref) {
-  // This service relies on the global API key set in main.dart
-  return OpenAIChatService(ref);
+// Legacy provider for backward compatibility (if needed)
+final openAIChatServiceProvider = Provider<AICompanionService>((ref) {
+  return ref.read(aiCompanionServiceProvider);
 });
 
 // Provider for the Title Generator Service

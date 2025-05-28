@@ -1,615 +1,686 @@
-// lib/presentation/providers/chat_providers.dart
+import 'dart:convert';
 import 'dart:io';
-
-import 'package:flutter/material.dart'; // For debugPrint
+import 'package:dart_openai/dart_openai.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:jinu/presentation/providers/memory_provider.dart';
-import 'package:jinu/presentation/providers/workspace_mode_provider.dart';
+import 'package:http/http.dart' as http;
+import 'package:jinu/core/constants.dart';
+import 'package:jinu/data/services/chat_history_service.dart';
+import 'package:jinu/presentation/providers/api_providers.dart';
+import 'package:mime/mime.dart';
+import 'package:pinecone/pinecone.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
-import 'api_providers.dart';
-import 'history_provider.dart';
-import 'settings_provider.dart';
-import '../../data/models/chat_message.dart';
-import '../../data/models/chat_session_item.dart';
-// For convertToOpenAIMessage helper
-// To access methods directly
-// Fpr OpenAIChatCompletionChoiceMessageModel
-
-const uuid = Uuid();
-
-// Provider to indicate if the AI is currently processing a message
-final isLoadingProvider = StateProvider<bool>((ref) => false);
-final isWebSearchEnabledProvider = Provider<bool>((ref) {
-  return ref.watch(appwmsProvider).isWebSearchModeEnabled;
-});
-
-final voiceOutputEnabledProvider = Provider<bool>((ref) {
-  return ref.watch(appwmsProvider).isVoiceModeEnabled;
-});
-final itHasImageProvider = Provider<bool>((ref) {
-  return ref.watch(appwmsProvider).isContentIncludeImageMode;
-});
-
-final itHasVoiceProvider = Provider<bool>((ref) {
-  return ref.watch(appwmsProvider).isContentIncludeVoiceMode;
-});
-
-final newTtsFileProvider = StateProvider<File?>(
-  (ref) => null,
-); // For UI to pick up new TTS audio
-
-
-// final chatHistoryEnabledProvider = StateProvider<bool>((ref) { // Already in history_provider
-// final settings = ref.watch(settingsServiceProvider);
-// return settings.historychatenabled;
-// });
-
-// final chatHistoryEnabledProvider = StateProvider<bool>((ref) {
-//   final settings = ref.watch(settingsServiceProvider);
-//   return settings.historychatenabled;
-// });
-// final chatHistoryServiceProvider = Provider<ChatHistoryService>((ref) {
-//   return ChatHistoryService();
-// });
-// --- Main Chat Controller ---
-// Handles sending messages, interacting with services, and managing loading state.
-// It interacts primarily with ChatHistoryService to modify chat state.
-
+import 'package:jinu/data/models/chat_message.dart';
+import 'package:jinu/data/models/chat_session_item.dart';
+import 'package:jinu/presentation/providers/settings_provider.dart';
 class ChatController extends StateNotifier<AsyncValue<void>> {
   final Ref ref;
 
-  ChatController(this.ref)
-    : super(const AsyncData(null)); // Use AsyncValue for loading/error state
+  ChatController(this.ref) : super(const AsyncData(null));
+
+
+//  ChatController(this.ref) : super(const AsyncData(null));
 
   Future<void> sendMessageWithAttachment(
-    ChatMessage
-    userMessagePlaceholder, // Message already added to UI by center_content_panel
+    ChatMessage userMessagePlaceholder,
     File attachmentFile,
   ) async {
-    // Read current toggle states for web search and voice output
-final isWebSearchEnabled = ref.watch(appwmsProvider).isWebSearchModeEnabled;
+    state = const AsyncLoading();
+    ref.read(isLoadingProvider.notifier).state = true;
 
+    final contentType = _determineContentType(userMessagePlaceholder.mimeType);
+    debugPrint("Sending attachment of type: $contentType");
 
-final voiceOutputEnabled = ref.watch(appwmsProvider).isVoiceModeEnabled;
-final itHasImage = ref.watch(appwmsProvider).isContentIncludeImageMode;
-
-
-final itHasVoice = ref.watch(appwmsProvider).isContentIncludeVoiceMode;
-    // Determine attachment content type (this should ideally come from userMessagePlaceholder or be detected)
-    // For simplicity, let's assume userMessagePlaceholder.contentType is correctly set by caller
-    ContentType attachmentContentType = userMessagePlaceholder.contentType;
-
-    // If contentType is generic file, attempt to infer from MIME or extension if not clearly image/audio
-    if (attachmentContentType == ContentType.file) {
-      String? mimeType = userMessagePlaceholder.mimeType;
-      if (mimeType != null) {
-        if (mimeType.startsWith('image/')) {
-          attachmentContentType = ContentType.image;
-        } else if (mimeType.startsWith('audio/')) {
-          attachmentContentType = ContentType.audio;
-        }
-      }
+    if (contentType == ContentType.image) {
+      await _sendImageMessage(
+        userMessagePlaceholder.content,
+        attachmentFile,
+      );
+    } else if (contentType == ContentType.audio) {
+      await _transcribeAndSendAudio(attachmentFile);
+    } else {
+      debugPrint("Generic file attached, not processed by LLM.");
+      ref.read(isLoadingProvider.notifier).state = false;
+      state = const AsyncData(null);
     }
-    debugPrint(
-   "sendMessageWithAttachment: placeholder='${userMessagePlaceholder.content}', attachmentType=$attachmentContentType",
-  );
-
-  if (attachmentContentType == ContentType.image) {
-   await sendMessage(
-    userMessagePlaceholder
-     .content, // This is the text that might accompany the image
-    imageFile: attachmentFile,
-    isWebSearchEnabled: isWebSearchEnabled, // Pass current state
-    voiceOutputEnabled: voiceOutputEnabled, // Pass current state
-   );
-  } else if (attachmentContentType == ContentType.audio) {
-   // The userMessagePlaceholder ([Sent Audio: xyz.mp3]) is already in history via UI
-   // Now transcribe and send
-   await transcribeAndSendAudio(attachmentFile);
-  } else {
-   // Generic file: Add to history (already done by UI), no further LLM processing here.
-   debugPrint(
-    "Generic file attached: ${attachmentFile.path}. Logged in history. No direct LLM processing planned for this type.",
-   );
-   // Simulate a successful "send" as it's logged.
-   ref.read(isLoadingProvider.notifier).state = false;
-   state = const AsyncData(null);
   }
- }
 
-    // --- Core Action: Send Message ---
-    Future<void> sendMessage(
-      String text, {
-      File? imageFile, // For sending an image with text
-      required bool isWebSearchEnabled,
-      required bool voiceOutputEnabled, // Renamed for clarity
-    }) async {
-      state = const AsyncLoading();
-      ref.read(isLoadingProvider.notifier).state = true;
+  ContentType _determineContentType(String? mimeType) {
+    if (mimeType == null) return ContentType.file;
+    if (mimeType.startsWith('image/')) return ContentType.image;
+    if (mimeType.startsWith('audio/')) return ContentType.audio;
+    return ContentType.file;
+  }
 
-      final historyService = ref.read(chatHistoryServiceProvider);
-      final settings = ref.read(settingsServiceProvider);
-      final chatService = ref.read(openAIChatServiceProvider);
-      final titleService = ref.read(titleGeneratorServiceProvider);
-      final memoryService = ref.read(longTermMemoryServiceProvider);
+  Future<void> _sendImageMessage(String text, File imageFile) async {
+    // Logic for sending image with text to OpenAI API
+    try {
+      // Placeholder for API call with image
+      debugPrint("Sending image: ${imageFile.path}");
+      // Add logic to handle image with base64 encoding if necessary
+      state = const AsyncData(null);
+    } catch (e) {
+      state = AsyncError("Failed to send image: $e", StackTrace.current);
+    } finally {
+      ref.read(isLoadingProvider.notifier).state = false;
+    }
+  }
 
-      // 1. Get Active Chat or Start New One
-      String? currentSessionId = historyService.activeChatId;
-      ChatSessionItem? currentSession;
-      currentSession = historyService.getSessionById(currentSessionId!);
-          final historyEnabled = settings.historychatenabled;
-      final String modelToUse;
-      if (imageFile != null) {
-        // Use vision model from settings (e.g., "gpt-4o-mini")
-        modelToUse =
-            settings.visionprocessingmodel.isNotEmpty
-                ? settings.visionprocessingmodel
-                : "gpt-4o-mini";
-        debugPrint("Image provided: Using vision model $modelToUse");
-      } else if (isWebSearchEnabled) {
-        // Use web search model from settings (e.g., "gpt-4o-mini-search-preview")
-        modelToUse = "gpt-4o-mini-search-preview"; // fallback
-        debugPrint("Web Search Enabled: Using web search model $modelToUse");
+  Future<void> _transcribeAndSendAudio(File audioFile) async {
+    // Placeholder for audio transcription logic
+    try {
+      debugPrint("Transcribing audio: ${audioFile.path}");
+      state = const AsyncData(null);
+    } catch (e) {
+      state = AsyncError("Failed to transcribe audio: $e", StackTrace.current);
+    } finally {
+      ref.read(isLoadingProvider.notifier).state = false;
+    }
+  }
+final isLoadingProvider = StateProvider<bool>((ref) => false);
+final chatControllerProvider =
+    StateNotifierProvider<ChatController, AsyncValue<void>>(
+        (ref) => ChatController(ref));
 
+// Streaming response providers
+final streamingMessageProvider = StateProvider<String?>((ref) => null);
+final isStreamingProvider = StateProvider<bool>((ref) => false);
+final streamingMessageIdProvider = StateProvider<String?>((ref) => null);
+
+
+  Future<void> sendMessageStreaming(
+    String text, {
+    File? imageFile,
+    required bool isWebSearchEnabled,
+    required bool voiceOutputEnabled,
+  }) async {
+    state = const AsyncLoading();
+    ref.read(isLoadingProvider.notifier).state = true;
+    ref.read(isStreamingProvider.notifier).state = true;
+    ref.read(streamingMessageProvider.notifier).state = "";
+    
+    final historyService = ref.read(chatHistoryServiceProvider);
+    final settings = ref.read(settingsServiceProvider);
+    final chatService = ref.read(aiCompanionServiceProvider);
+    final titleService = ref.read(titleGeneratorServiceProvider);
+
+    String? currentSessionId = historyService.activeChatId;
+    ChatSessionItem? currentSession;
+    if (currentSessionId == null) {
+      currentSession = await historyService.startNewChat();
+      currentSessionId = currentSession.id;
+    } else {
+      currentSession = historyService.getSessionById(currentSessionId);
+    }
+    
+    final historyEnabled = settings.historychatenabled;
+    final String modelToUse;
+    if (imageFile != null) {
+      modelToUse =
+          settings.visionprocessingmodel.isNotEmpty
+              ? settings.visionprocessingmodel
+              : "gpt-4o-mini";
+    } else if (isWebSearchEnabled) {
+      modelToUse = "gpt-4o-mini-search-preview";
+    } else {
+      modelToUse = settings.defaultchatmodel;
+    }
+    
+    if (historyEnabled) {
+      currentSession = historyService.getSessionById(currentSessionId);
+      if (currentSession == null) {
+        currentSession = await historyService.startNewChat();
+        currentSessionId = currentSession.id;
       }
-       else {
-        modelToUse = settings.defaultchatmodel;
-        debugPrint("Standard Chat: Using model $modelToUse");
-      }
+    } else {
+      state = AsyncError("Chat history is disabled", StackTrace.current);
+      ref.read(isLoadingProvider.notifier).state = false;
+      ref.read(isStreamingProvider.notifier).state = false;
+      return;
+    }
 
-      if (historyEnabled) {
-        currentSession = historyService.getSessionById(currentSessionId);
-      } else {
-        // History is disabled - operate on a temporary in-memory session
-        // For simplicity here, we'll just prevent sending if history disabled.
-        // A more complex implementation would manage a temporary message list.
-        debugPrint("Chat history is disabled. Cannot send message.");
-        state = AsyncError("Chat history is disabled", StackTrace.current);
-        ref.read(isLoadingProvider.notifier).state =
-            false; // Ensure loading is off
-        return;
-      }
+    final userMessage = ChatMessage(
+      sender: MessageSender.user,
+      content: text,
+      timestamp: DateTime.now(),
+      filePath: imageFile?.path,
+      contentType: imageFile != null ? ContentType.image : ContentType.text,
+      fileName: imageFile?.path.split('/').last,
+    );
 
-      // 2. Create User Message
-      final userMessage = ChatMessage(
-        sender: MessageSender.user,
-        content: text,
+    try {
+      await historyService.addMessageToSession(currentSessionId, userMessage);
+      currentSession = historyService.getSessionById(currentSessionId);
+    } catch (e, s) {
+      state = AsyncError("Failed to save user message", s);
+      ref.read(isLoadingProvider.notifier).state = false;
+      ref.read(isStreamingProvider.notifier).state = false;
+      return;
+    }
+
+    // Generate title if needed
+    final bool isFirstUserMessage =
+        currentSession?.messages
+            .where((m) => m.sender == MessageSender.user)
+            .length ==
+        1;
+    if (settings.autotitle &&
+        isFirstUserMessage &&
+        historyEnabled &&
+        text.isNotEmpty) {
+      try {
+        final generatedTitle = await titleService.generateTitle(text);
+        await historyService.updateSessionTitle(
+          currentSessionId,
+          generatedTitle,
+        );
+      } catch (e) {}
+    }
+
+    // Prepare messages for API
+    List<ChatMessage> messagesForApi = [];
+    final systemPrompt = settings.systemInstruction;
+    if (systemPrompt.isNotEmpty) {
+      messagesForApi.add(
+        ChatMessage(
+          sender: MessageSender.system,
+          content: systemPrompt,
+          contentType: ContentType.text,
+          openAIRole: OpenAIRole.system,
+        ),
+      );
+    }
+
+    List<ChatMessage> historyMessages = currentSession!.messages;
+    if (settings.historybufferlength > 0 &&
+        historyMessages.length > settings.historybufferlength) {
+      messagesForApi.addAll(
+        historyMessages.sublist(
+          historyMessages.length - settings.historybufferlength,
+        ),
+      );
+    } else if (settings.historybufferlength == 0) {
+      if (!messagesForApi.contains(userMessage)) {
+        messagesForApi.add(userMessage);
+      }
+    } else {
+      messagesForApi.addAll(historyMessages);
+    }
+
+    try {
+      // Create a placeholder AI message for streaming
+      final aiMessageId = const Uuid().v4();
+      ref.read(streamingMessageIdProvider.notifier).state = aiMessageId;
+      
+      final aiMessage = ChatMessage(
+        id: aiMessageId,
+        sender: MessageSender.ai,
+        content: "",
         timestamp: DateTime.now(),
-        filePath: imageFile?.path,
-        contentType: imageFile != null ? ContentType.image : ContentType.text,
-        fileName: imageFile?.path.split('/').last,
-        // You might want to add fileSize, mimeType if ChatMessage structure supports it
+        contentType: ContentType.text,
+      );
+      
+      // Add placeholder message to history
+      await historyService.addMessageToSession(currentSessionId, aiMessage);
+      
+      // Start streaming
+      String accumulatedContent = "";
+      final responseStream = chatService.generateChatCompletionStream(
+        model: modelToUse,
+        messages: messagesForApi,
+        temperature: settings.temperature,
+        maxTokens: settings.maxOutputTokens > 0 ? settings.maxOutputTokens : null,
+        topP: settings.topP,
       );
 
-      // 3. Update State Immediately (Add user message to History Service)
-      ref.read(isLoadingProvider.notifier).state = true;
-      try {
-        await historyService.addMessageToSession(currentSessionId, userMessage);
-        // Get the updated session after adding the message
-        currentSession = historyService.getSessionById(currentSessionId);
-      } catch (e, s) {
-        debugPrint("Error adding user message to session: $e\n$s");
-        state = AsyncError("Failed to save user message", s);
-        ref.read(isLoadingProvider.notifier).state = false;
-        return;
-      }
-
-      final bool isFirstUserMessage =
-          currentSession!.messages
-              .where((m) => m.sender == MessageSender.user)
-              .length ==
-          1;
-      if (settings.autotitle &&
-          isFirstUserMessage &&
-          historyEnabled &&
-          text.isNotEmpty) {
-        try {
-          final generatedTitle = await titleService.generateTitle(text);
-          await historyService.updateSessionTitle(
-            currentSessionId,
-            generatedTitle,
-          );
-        } catch (e) {
-          debugPrint("Title generation failed: $e");
+      await for (final streamChunk in responseStream) {
+        if (streamChunk.choices.isNotEmpty) {
+          final delta = streamChunk.choices.first.delta;
+          if (delta.content != null && delta.content!.isNotEmpty) {
+            for (final contentItem in delta.content!) {
+              if (contentItem.text != null) {
+                accumulatedContent += contentItem.text!;
+                ref.read(streamingMessageProvider.notifier).state = accumulatedContent;
+              }
+            }
+          }
         }
       }
 
-      // 4. Generate Title (if enabled, first message, and history enabled)
-      // final bool isFirstUserMessage =
-      //     currentSession?.messages
-      //         .where((m) => m.sender == MessageSender.user)
-      //         .length ==
-      //     1;
-      // if (settings.autotitle && isFirstUserMessage && historyEnabled) {
-      //   try {
-      //     debugPrint("Generating title for session $currentSessionId...");
-      //     final generatedTitle = await titleService.generateTitle(text);
-      //     await historyService.updateSessionTitle(
-      //       currentSessionId,
-      //       generatedTitle,
-      //     );
-      //     debugPrint("Title generated: $generatedTitle");
-      //   } catch (e) {
-      //     debugPrint("Title generation failed: $e");
-      //     // Continue without blocking chat
-      //   }
-      // }
+      // Update the final message in history
+      final finalAiMessage = aiMessage.copyWith(content: accumulatedContent);
+      await historyService.updateMessageInSession(currentSessionId, aiMessageId, finalAiMessage);
 
-      // 5. Prepare API Call
-      // --- Prepare Messages for API ---
-      List<ChatMessage> messagesForApi = [];
-
-      // 1. Add System Prompt (if any)
-      final systemPrompt = settings.systemInstruction;
-      if (systemPrompt.isNotEmpty) {
-        messagesForApi.add(
-          ChatMessage(
-            sender: MessageSender.system,
-            content: systemPrompt,
-            contentType: ContentType.text,
-            openAIRole: OpenAIRole.system, // Use dedicated role if possible
-          ),
-        );
-      }
-
-      // 2. Add Long-Term Memory Context (if enabled) - Context Augmentation Approach
-      if (settings.turnofftools == false) {
-        // Using 'usetools' as the toggle for memory
+      // Handle TTS if enabled
+      if (voiceOutputEnabled && accumulatedContent.isNotEmpty) {
         try {
-          // Retrieve relevant memories based on the *user's latest message*
-          final memoryResult = memoryService.retrieveMemoryItems(text);
-          if (memoryResult['status'] == 'Success' &&
-              memoryResult['data'] != null &&
-              (memoryResult['data'] as String).isNotEmpty) {
-            final memoryContext = memoryResult['data'] as String;
-            debugPrint("Injecting LTM context:\n$memoryContext");
-            // Inject as a system message before the user's content
-            messagesForApi.add(
-              ChatMessage(
-                sender: MessageSender.system,
-                // Prepend with a clear label for the AI
-                content:
-                    "Relevant information from your long-term memory based on the user's query:\n---\n$memoryContext\n---",
-                contentType: ContentType.text,
-                openAIRole: OpenAIRole.system,
-              ),
-            );
-          } else if (memoryResult['status'] == 'Error') {
-            debugPrint("LTM retrieval error: ${memoryResult['message']}");
-            // Optionally inform the user or just log it
+          final ttsFileName = "ai_response_${DateTime.now().millisecondsSinceEpoch}";
+          final ttsAudioFile = await chatService.createAudioSpeech(
+            textContent: accumulatedContent,
+            filename: ttsFileName,
+          );
+          if (ttsAudioFile != null) {
+            ref.read(newTtsFileProvider.notifier).state = ttsAudioFile;
           }
         } catch (e) {
-          debugPrint("Error during LTM retrieval: $e");
-          // Non-fatal, continue without memory context
+          debugPrint('TTS Error: $e');
         }
       }
 
-      // 3. Add Chat History (respecting buffer)
-      List<ChatMessage> historyMessages =
-          currentSession.messages; // Get all messages (incl. user's new one)
-      if (settings.historybufferlength > 0 &&
-          historyMessages.length > settings.historybufferlength) {
-        messagesForApi.addAll(
-          historyMessages.sublist(
-            historyMessages.length - settings.historybufferlength,
-          ),
+      state = const AsyncData(null);
+    } catch (e, s) {
+      String errorMsg = e.toString().replaceFirst("Exception: ", "");
+      state = AsyncError("AI Error: $errorMsg", s);
+      if (historyEnabled) {
+        final errorMessage = ChatMessage(
+          sender: MessageSender.system,
+          content: "Error: Failed to get response.\n$errorMsg",
+          timestamp: DateTime.now(),
+          metadata: {'error': true},
         );
-      } else if (settings.historybufferlength == 0) {
-        // If buffer is 0, only send the *last user message* which is already constructed
-        // Ensure we don't add history messages if buffer is 0
-        // We already added the user message if history is disabled
-        // Need to ensure the userMessage is included if history is enabled but buffer=0
-        if (!messagesForApi.contains(userMessage)) {
-          // Ensure user message is there
-          messagesForApi.add(userMessage);
-        }
-      } else {
-        messagesForApi.addAll(
-          historyMessages,
-        ); // Add full history if buffer > length or negative
+        try {
+          await historyService.addMessageToSession(
+            currentSessionId,
+            errorMessage,
+          );
+        } catch (histErr) {}
       }
-      Map<String, dynamic>? webSearchHttpOptions;
-      if (isWebSearchEnabled) {
-        // Structure from your new code: {'web_search_options': {...}}
-        webSearchHttpOptions = {
-          'web_search_options': {
-            'user_location': {
-              'type': 'approximate',
-              'approximate': {
-                'country':
-                    settings.customsearchlocation.isNotEmpty
-                        ? settings.customsearchlocation
-                        : 'GB',
-                //       'city': settings.webSearchCity.isNotEmpty ? settings.webSearchCity : 'London',
-                //     'region': settings.webSearchRegion.isNotEmpty ? settings.webSearchRegion : 'London',
+    } finally {
+      ref.read(isLoadingProvider.notifier).state = false;
+      ref.read(isStreamingProvider.notifier).state = false;
+      ref.read(streamingMessageProvider.notifier).state = null;
+      ref.read(streamingMessageIdProvider.notifier).state = null;
+    }
+  }
 
-                //should be in the settings
-              },
-            },
-            // Add other options like 'max_results' if your API supports them
-          },
-        };
+  Future<void> sendMessage(
+    String text, {
+    File? imageFile,
+    required bool isWebSearchEnabled,
+    required bool voiceOutputEnabled,
+  }) async {
+    state = const AsyncLoading();
+    ref.read(isLoadingProvider.notifier).state = true;
+    final historyService = ref.read(chatHistoryServiceProvider);
+    final settings = ref.read(settingsServiceProvider);
+    final chatService = ref.read(aiCompanionServiceProvider);
+    final titleService = ref.read(titleGeneratorServiceProvider);
+
+    String? currentSessionId = historyService.activeChatId;
+    ChatSessionItem? currentSession;
+    if (currentSessionId == null) {
+      currentSession = await historyService.startNewChat();
+      currentSessionId = currentSession.id;
+    } else {
+      currentSession = historyService.getSessionById(currentSessionId);
+    }
+    final historyEnabled = settings.historychatenabled;
+    final String modelToUse;
+    if (imageFile != null) {
+      modelToUse =
+          settings.visionprocessingmodel.isNotEmpty
+              ? settings.visionprocessingmodel
+              : "gpt-4o-mini";
+    } else if (isWebSearchEnabled) {
+      modelToUse = "gpt-4o-mini-search-preview";
+    } else {
+      modelToUse = settings.defaultchatmodel;
+    }
+    if (historyEnabled) {
+      currentSession = historyService.getSessionById(currentSessionId);
+      if (currentSession == null) {
+        currentSession = await historyService.startNewChat();
+        currentSessionId = currentSession.id;
       }
+    } else {
+      state = AsyncError("Chat history is disabled", StackTrace.current);
+      ref.read(isLoadingProvider.notifier).state = false;
+      return;
+    }
 
-      // --- Call API using the Service ---
+    final userMessage = ChatMessage(
+      sender: MessageSender.user,
+      content: text,
+      timestamp: DateTime.now(),
+      filePath: imageFile?.path,
+      contentType: imageFile != null ? ContentType.image : ContentType.text,
+      fileName: imageFile?.path.split('/').last,
+    );
+
+    try {
+      await historyService.addMessageToSession(currentSessionId, userMessage);
+      currentSession = historyService.getSessionById(currentSessionId);
+    } catch (e, s) {
+      state = AsyncError("Failed to save user message", s);
+      ref.read(isLoadingProvider.notifier).state = false;
+      return;
+    }
+
+    final bool isFirstUserMessage =
+        currentSession?.messages
+            .where((m) => m.sender == MessageSender.user)
+            .length ==
+        1;
+    if (settings.autotitle &&
+        isFirstUserMessage &&
+        historyEnabled &&
+        text.isNotEmpty) {
       try {
-        final response = await chatService.generateChatCompletion(
-          // Pass parameters from settings or determined logic
-          model: modelToUse,
-          messages: messagesForApi, // Pass our ChatMessage list
-          temperature: settings.temperature,
-          maxTokens:
-              settings.maxOutputTokens > 0 ? settings.maxOutputTokens : null,
-          topP: settings.topP,
-          webSearchOptions: webSearchHttpOptions,
-          //tools: [], // We are doing context augmentation, not tool calling for memory *yet*
+        final generatedTitle = await titleService.generateTitle(text);
+        await historyService.updateSessionTitle(
+          currentSessionId,
+          generatedTitle,
         );
+      } catch (e) {}
+    }
 
-        // 7. Process Response and Update State
-        // TODO: Handle potential tool calls from the response if implemented
-        // if (response.choices.first.message.haveToolCalls) { ... }
-        final List<dynamic>? annotations =
-            response.choices.first.message.toMap()['annotations'];
-        final List<dynamic>? reasoning =
-            response.choices.first.message.toMap()['reasoning'];
-        if (reasoning != null && reasoning.isNotEmpty) {
-          debugPrint("Web search reasoning received: $reasoning");
-        }
+    List<ChatMessage> messagesForApi = [];
+    final systemPrompt = settings.systemInstruction;
+    if (systemPrompt.isNotEmpty) {
+      messagesForApi.add(
+        ChatMessage(
+          sender: MessageSender.system,
+          content: systemPrompt,
+          contentType: ContentType.text,
+          openAIRole: OpenAIRole.system,
+        ),
+      );
+    }
 
-        if (annotations != null && annotations.isNotEmpty) {
-          debugPrint("Web search annotations received: $annotations");
-        }
-        final aiContent =
-            response.choices.first.message.content?.first.text ??
-            "AI Response was empty.";
-        final Map<String, dynamic> aiMetadata = {
-          'model_name':
-              response.choices.first.message
-                  .toMap()['model'], // Use model from RESPONSE
-          'finish_reason': response.choices.first.finishReason,
-          'usage_prompt_tokens': response.usage.promptTokens,
-          'usage_completion_tokens': response.usage.completionTokens,
-          'usage_total_tokens': response.usage.totalTokens,
-          'response_id': response.id, // Add response ID
-        };
+    List<ChatMessage> historyMessages = currentSession!.messages;
+    if (settings.historybufferlength > 0 &&
+        historyMessages.length > settings.historybufferlength) {
+      messagesForApi.addAll(
+        historyMessages.sublist(
+          historyMessages.length - settings.historybufferlength,
+        ),
+      );
+    } else if (settings.historybufferlength == 0) {
+      if (!messagesForApi.contains(userMessage)) {
+        messagesForApi.add(userMessage);
+      }
+    } else {
+      messagesForApi.addAll(historyMessages);
+    }
 
-        aiMetadata.removeWhere(
-          (key, value) => key.startsWith('usage_') && value == null,
-        );
-        // Use the new fromOpenAI factory method
-        final aiMessage = ChatMessage.fromOpenAI({
-          'role': response.choices.first.message.role.name,
-          'content': aiContent,
-          'metadata': aiMetadata,
-        });
+    Map<String, dynamic>? webSearchOptions;
+    if (isWebSearchEnabled) {
+      webSearchOptions = {
+        'web_search_options': {
+          'user_location': {
+            'type': 'approximate',
+            'approximate': {
+              'country':
+                  settings.customsearchlocation.isNotEmpty
+                      ? settings.customsearchlocation
+                      : 'GB',
+            },
+          },
+        },
+      };
+    }
 
-        // Add AI message to history (if enabled)
-        if (historyEnabled) {
-          await historyService.addMessageToSession(currentSessionId, aiMessage);
-        } else {
-          // Handle displaying AI message if history is off (e.g., temporary list)
-        }
+    try {
+      final response = await chatService.generateChatCompletion(
+        model: modelToUse,
+        messages: messagesForApi,
+        temperature: settings.temperature,
+        maxTokens:
+            settings.maxOutputTokens > 0 ? settings.maxOutputTokens : null,
+        topP: settings.topP,
+        webSearchOptions: webSearchOptions,
+        sessionId: currentSessionId,
+      );
 
-        // if (ref.read(voiceOutputEnabledProvider)) {
-        //   try {
-        //     final ttsFileName =
-        //         "ai_response_${DateTime.now().millisecondsSinceEpoch}";
-        //     final ttsAudioFile = await chatService.createAudioSpeech(
-        //       textContent: aiContent,
-        //       filename: ttsFileName,
-        //       // ttsModel and voice will be taken from service defaults or settings
-        //     );
-        //     if (ttsAudioFile != null) {
-        //       ref.read(newTtsFileProvider.notifier).state = ttsAudioFile;
-        //     }
-        //   } catch (e) {
-        //     debugPrint("Error generating TTS for AI response: $e");
-        //   }
-        // }
-        // Check if the response contains tool calls
-        if (response.choices.first.message.haveToolCalls) {
-          try {
-            // Handle tool calls
-            await chatService.handleToolCalls(response);
+      final aiContent =
+          response.choices.first.message.content?.first.text ??
+          "AI Response was empty.";
+      final Map<String, dynamic> aiMetadata = {
+        'model_name': response.choices.first.message.toMap()['model'],
+        'finish_reason': response.choices.first.finishReason,
+        'usage_prompt_tokens': response.usage.promptTokens,
+        'usage_completion_tokens': response.usage.completionTokens,
+        'usage_total_tokens': response.usage.totalTokens,
+        'response_id': response.id,
+      };
+      aiMetadata.removeWhere(
+        (key, value) => key.startsWith('usage_') && value == null,
+      );
 
-            // Optionally, generate a follow-up response with the tool results
-            final toolCalls =
-                response.choices.first.message.toMap()['tool_calls']
-                    as List<Map<String, dynamic>>;
-            final toolCallMessages =
-                toolCalls
-                    .map((toolCall) => ChatMessage.fromOpenAI(toolCall))
-                    .toList();
+      final aiMessage = ChatMessage.fromJson({
+        'role': response.choices.first.message.role.name,
+        'content': aiContent,
+        'metadata': aiMetadata,
+      });
 
-            final followUpResponse = await chatService.generateChatCompletion(
-              model: modelToUse,
-              messages: [
-                ...messagesForApi,
-                ...toolCallMessages,
-                ChatMessage(
-                  content:
-                      "The requested actions have been completed. Please confirm to the user what was done.",
-                  sender: MessageSender.system,
-                ),
-              ],
-              temperature: settings.temperature,
-              maxTokens:
-                  settings.maxOutputTokens > 0
-                      ? settings.maxOutputTokens
-                      : null,
-              topP: settings.topP,
+      if (historyEnabled) {
+        await historyService.addMessageToSession(currentSessionId, aiMessage);
+      }
+
+      if (voiceOutputEnabled) {
+        try {
+          final ttsFileName =
+              "ai_response_${DateTime.now().millisecondsSinceEpoch}";
+          final ttsAudioFile = await chatService.createAudioSpeech(
+            textContent: aiContent,
+            filename: ttsFileName,
+          );
+          if (ttsAudioFile != null) {
+            ref.read(newTtsFileProvider.notifier).state = ttsAudioFile;
+          }
+        } catch (e) {}
+      }
+
+      if (response.choices.first.message.haveToolCalls) {
+        try {
+          final toolResults = await chatService.handleToolCalls(response);
+          for (final toolResult in toolResults) {
+            final toolMessage = ChatMessage(
+              sender: MessageSender.system,
+              content: toolResult,
+              timestamp: DateTime.now(),
+              contentType: ContentType.text,
+              metadata: {'tool_result': true},
             );
-
-            // Process the follow-up response
-            final followUpContent =
-                followUpResponse.choices.first.message.content?.first.text ??
-                "Follow-up AI Response was empty.";
-            final followUpMessage = ChatMessage.fromOpenAI({
-              'role': followUpResponse.choices.first.message.role.name,
-              'content': followUpContent,
-              'metadata': {
-                'model_name':
-                    followUpResponse.choices.first.message.toMap()['model'],
-                'finish_reason': followUpResponse.choices.first.finishReason,
-                'response_id': followUpResponse.id,
-              },
-            });
-
-            // Add follow-up message to history (if enabled)
             if (historyEnabled) {
               await historyService.addMessageToSession(
                 currentSessionId,
-                followUpMessage,
+                toolMessage,
               );
             }
-          } catch (e) {
-            debugPrint(
-              "Error handling tool calls or generating follow-up response: $e",
-            );
           }
-        }
-        state = const AsyncData(null); // Signal success
-      } catch (e, s) {
-        debugPrint("Error sending message to AI: $e\n$s");
-        String errorMsg = e.toString().replaceFirst("Exception: ", "");
-        state = AsyncError("AI Error: $errorMsg", s);
-        // Add error message to chat (same as before)
-        if (historyEnabled) {
-          final errorMessage = ChatMessage(
-            sender: MessageSender.system,
-            content: "Error: Failed to get response.\n$errorMsg",
-            timestamp: DateTime.now(),
-            metadata: {'error': true},
+
+          final toolCalls =
+              response.choices.first.message.toMap()['tool_calls']
+                  as List<Map<String, dynamic>>;
+          final toolCallMessages =
+              toolCalls
+                  .map(
+                    (toolCall) => ChatMessage.fromOpenAIResponse(
+                      id: aiContent,
+                      role: OpenAIRole.tool.toString(),
+                    ),
+                  )
+                  .toList();
+          final followUpResponse = await chatService.generateChatCompletion(
+            model: modelToUse,
+            messages: [
+              ...messagesForApi,
+              ...toolCallMessages,
+              ChatMessage(
+                content:
+                    "The requested actions have been completed. Please confirm to the user what was done.",
+                sender: MessageSender.system,
+              ),
+            ],
+            temperature: settings.temperature,
+            maxTokens:
+                settings.maxOutputTokens > 0 ? settings.maxOutputTokens : null,
+            topP: settings.topP,
+            sessionId: currentSessionId,
           );
-          try {
+
+          final followUpContent =
+              followUpResponse.choices.first.message.content?.first.text ??
+              "Follow-up AI Response was empty.";
+          final followUpMessage = ChatMessage.fromJson({
+            'role': followUpResponse.choices.first.message.role.name,
+            'content': followUpContent,
+            'metadata': {
+              'model_name':
+                  followUpResponse.choices.first.message.toMap()['model'],
+              'finish_reason': followUpResponse.choices.first.finishReason,
+              'response_id': followUpResponse.id,
+            },
+          });
+          if (historyEnabled) {
             await historyService.addMessageToSession(
               currentSessionId,
-              errorMessage,
+              followUpMessage,
             );
-          } catch (histErr) {
-            debugPrint("Failed to add error message to history: $histErr");
           }
-        }
-      } finally {
-        ref.read(isLoadingProvider.notifier).state = false;
+        } catch (e) {}
       }
-    }
 
-    Future<void> transcribeAndSendAudio(File audioFile) async {
-      // No webSearchEnabled param here, we'll use the global provider state
-      final isWebSearchEnabled = ref.read(isWebSearchEnabledProvider);
-      final voiceOutputEnabled = ref.read(voiceOutputEnabledProvider);
-      state = const AsyncLoading();
-      ref.read(isLoadingProvider.notifier).state = true;
-      final historyService = ref.read(chatHistoryServiceProvider);
-      final settings = ref.read(settingsServiceProvider);
-      final chatService = ref.read(openAIChatServiceProvider);
-      String? currentSessionId = historyService.activeChatId;
-
-      try {
-        // 1. Add a placeholder message for the audio being processed (optional but good UX)
-        if (settings.historychatenabled) {
-          final audioPlaceholderMsg = ChatMessage(
-            sender: MessageSender.user,
-            content: "[Processing audio: ${audioFile.path.split('/').last}...]",
-            timestamp: DateTime.now(),
-            contentType:
-                ContentType.audio, // Or a custom "system_processing" type
-            filePath: audioFile.path,
-          );
-          await historyService.addMessageToSession(
-            currentSessionId!,
-            audioPlaceholderMsg,
-          );
-        }
-
-        // 2. Transcribe Audio
-        // Model for transcription can be from settings e.g. "gpt-4o-mini-transcribe" or "whisper-1"
-        final transcribedText = await chatService.transcribeAudioFile(
-          filePath: audioFile.path,
-          // transcriptionModel will be taken from service defaults or settings
+      state = const AsyncData(null);
+    } catch (e, s) {
+      String errorMsg = e.toString().replaceFirst("Exception: ", "");
+      state = AsyncError("AI Error: $errorMsg", s);
+      if (historyEnabled) {
+        final errorMessage = ChatMessage(
+          sender: MessageSender.system,
+          content: "Error: Failed to get response.\n$errorMsg",
+          timestamp: DateTime.now(),
+          metadata: {'error': true},
         );
-
-        if (transcribedText != null && transcribedText.isNotEmpty) {
-          // 3. Send transcribed text as a new message
-          // Replace the placeholder or send as a new message with the transcription
-          // For simplicity, sending as new message:
-          debugPrint("Transcribed text: '$transcribedText'. Sending to AI.");
-          // imageFile will be null for this transcribed message
-          await sendMessage(
-            transcribedText,
-            imageFile: null,
-            isWebSearchEnabled: isWebSearchEnabled,
-            voiceOutputEnabled: voiceOutputEnabled,
+        try {
+          await historyService.addMessageToSession(
+            currentSessionId,
+            errorMessage,
           );
-          // sendMessage will handle loading state and AsyncData/AsyncError
-        } else {
-          throw Exception("Transcription failed or produced empty text.");
-        }
-      } catch (e, s) {
-        debugPrint("Error in transcribeAndSendAudio: $e\n$s");
-        String errorMsg = e.toString().replaceFirst("Exception: ", "");
-        state = AsyncError("Audio Processing Error: $errorMsg", s);
-        if (settings.historychatenabled) {
-          final errorMessage = ChatMessage(
-            sender: MessageSender.system,
-            content: "Error processing audio file: $errorMsg",
-            timestamp: DateTime.now(),
-            metadata: {'error': true},
-          );
-          try {
-            await historyService.addMessageToSession(
-              currentSessionId!,
-              errorMessage,
-            );
-          } catch (histErr) {
-            debugPrint(
-              "Failed to add audio error message to history: $histErr",
-            );
-          }
-        }
-        ref.read(isLoadingProvider.notifier).state =
-            false; // Ensure loading is off on error here
+        } catch (histErr) {}
       }
-      // isLoadingProvider is primarily managed by the final sendMessage call or error path within it.
-      // If an error occurs *before* sendMessage is called (e.g., transcription itself fails badly),
-      // ensure isLoading is false.
-    }
-
-    void createNewChat() {
-      final historyEnabled = ref.read(chatHistoryEnabledProvider);
-      if (!historyEnabled) {
-        debugPrint("Cannot create new chat: History is disabled.");
-        // Optionally show a message to the user
-        return;
-      }
-      // startNewChat handles adding to list and setting active ID
-      ref.read(chatHistoryServiceProvider).startNewChat();
-    }
-
-    void selectChat(String sessionId) {
-      final historyEnabled = ref.read(chatHistoryEnabledProvider);
-      if (!historyEnabled) {
-        debugPrint("Cannot select chat: History is disabled.");
-        return;
-      }
-      // setActiveChatId handles checking existence and notifying
-      ref.read(chatHistoryServiceProvider).setActiveChatId(sessionId);
-    }
-
-    void deleteChat(String sessionId) {
-      final historyEnabled = ref.read(chatHistoryEnabledProvider);
-      if (!historyEnabled) {
-        debugPrint("Cannot delete chat: History is disabled.");
-        return;
-      }
-      ref.read(chatHistoryServiceProvider).deleteChatSession(sessionId);
+    } finally {
+      ref.read(isLoadingProvider.notifier).state = false;
     }
   }
 
-  final chatControllerProvider =
-      StateNotifierProvider<ChatController, AsyncValue<void>>((ref) {
-        return ChatController(ref);
-      });
+  Future<void> transcribeAndSendAudio(File audioFile) async {
+    final isWebSearchEnabled = ref.read(isWebSearchEnabledProvider);
+    final voiceOutputEnabled = ref.read(voiceOutputEnabledProvider);
+    state = const AsyncLoading();
+    ref.read(isLoadingProvider.notifier).state = true;
+    final historyService = ref.read(chatHistoryServiceProvider);
+    final settings = ref.read(settingsServiceProvider);
+    final chatService = ref.read(aiCompanionServiceProvider);
+    String? currentSessionId = historyService.activeChatId;
 
+    try {
+      if (currentSessionId != null && settings.historychatenabled) {
+        final audioPlaceholderMsg = ChatMessage(
+          sender: MessageSender.user,
+          content: "[Processing audio: ${audioFile.path.split('/').last}...]",
+          timestamp: DateTime.now(),
+          contentType: ContentType.audio,
+          filePath: audioFile.path,
+        );
+        await historyService.addMessageToSession(
+          currentSessionId,
+          audioPlaceholderMsg,
+        );
+      }
 
+      final transcribedText = await chatService.transcribeAudioFile(
+        filePath: audioFile.path,
+      );
+      if (transcribedText != null && transcribedText.isNotEmpty) {
+        await sendMessage(
+          transcribedText,
+          imageFile: null,
+          isWebSearchEnabled: isWebSearchEnabled,
+          voiceOutputEnabled: voiceOutputEnabled,
+        );
+      } else {
+        throw Exception("Transcription failed or produced empty text.");
+      }
+    } catch (e, s) {
+      String errorMsg = e.toString().replaceFirst("Exception: ", "");
+      state = AsyncError("Audio Processing Error: $errorMsg", s);
+      if (currentSessionId != null && settings.historychatenabled) {
+        final errorMessage = ChatMessage(
+          sender: MessageSender.system,
+          content: "Error processing audio file: $errorMsg",
+          timestamp: DateTime.now(),
+          metadata: {'error': true},
+        );
+        try {
+          await historyService.addMessageToSession(
+            currentSessionId,
+            errorMessage,
+          );
+        } catch (histErr) {}
+      }
+      ref.read(isLoadingProvider.notifier).state = false;
+    }
+  }
+
+  void createNewChat() {
+    final historyEnabled = ref.read(chatHistoryEnabledProvider);
+    if (!historyEnabled) {
+      return;
+    }
+    ref.read(chatHistoryServiceProvider).startNewChat();
+  }
+
+  void selectChat(String sessionId) {
+    final historyEnabled = ref.read(chatHistoryEnabledProvider);
+    if (!historyEnabled) {
+      return;
+    }
+    ref.read(chatHistoryServiceProvider).setActiveChatId(sessionId);
+  }
+
+  void deleteChat(String sessionId) {
+    final historyEnabled = ref.read(chatHistoryEnabledProvider);
+    if (!historyEnabled) {
+      return;
+    }
+    ref.read(chatHistoryServiceProvider).deleteChatSession(sessionId);
+  }
+
+  Future<List<OpenAIModelModel>> getModelList() async {
+    final chatService = ref.read(aiCompanionServiceProvider);
+    return await chatService.getModelList();
+  }
+
+  Future<OpenAIModelModel> getModelInfo(String modelId) async {
+    final chatService = ref.read(aiCompanionServiceProvider);
+    return await chatService.getModelInfo(modelId);
+  }
+
+  Future<String> generateImage(String prompt) async {
+    final chatService = ref.read(aiCompanionServiceProvider);
+    return await chatService.createImage(prompt);
+  }
+
+  Future<List<double>> createEmbeddings(String text) async {
+    final chatService = ref.read(aiCompanionServiceProvider);
+    return await chatService.createEmbeddings(text);
+  }
+
+  Future<dynamic> retrieveFileContent(String fileId) async {
+    final chatService = ref.read(aiCompanionServiceProvider);
+    return await chatService.retrieveFileContent(fileId);
+  }
+}
+
+// Providers
+final isLoadingProvider = StateProvider<bool>((ref) => false);
+final isWebSearchEnabledProvider = StateProvider<bool>((ref) => false);
+final voiceOutputEnabledProvider = StateProvider<bool>((ref) => false);
+final newTtsFileProvider = StateProvider<File?>((ref) => null);
+final chatControllerProvider =
+    StateNotifierProvider<ChatController, AsyncValue<void>>((ref) {
+      return ChatController(ref);
+    });
