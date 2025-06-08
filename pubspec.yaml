@@ -54,6 +54,21 @@ dependencies:
   audioplayers: ^5.2.1
   record: ^5.0.4
 
+  # Markdown & Code Highlighting
+  markdown_widget: ^2.3.2+6
+  flutter_code_editor: ^0.3.0
+  flutter_highlight: ^0.7.0
+  highlight: ^0.7.0
+  
+  # OCR & Document Scanning
+  flutter_doc_scanner: ^1.0.2
+  super_clipboard: ^0.8.12
+  mime: ^1.0.4
+  
+  # Advanced UI Components
+  uuid: ^4.1.0
+  provider: ^6.1.1
+
   # Utils
   intl: ^0.18.1
   url_launcher: ^6.2.1
